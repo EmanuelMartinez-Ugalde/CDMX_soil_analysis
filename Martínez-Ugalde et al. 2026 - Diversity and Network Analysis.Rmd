@@ -1,0 +1,968 @@
+---
+title: "Martínez-Ugalde et al. 2026 - Diversity and Network Analysis"
+description: This is an R notebook that contains all the commands used to perform diversity and network analysis presented in the "Microbial community networks reveal ecological consequences of soil management in Mexico City conservation landscape" manuscript. To run these commands you must load the functions provided in the "Martínez-Ugalde et al. 2026 - In house R functions" notebook.
+---
+##############################
+1. Prepare an R env to run the analysis
+##############################
+1.1 Setwd
+```{r}
+setwd("~/Desktop/2026_papers/CDMX_networks/")
+```
+
+1.2 Load CRAN and GitHub packages
+```{r}
+cran_packages = c("tidyverse","devtools","dplyr","igraph",
+                  "janitor","ggraph","patchwork","mclust",
+                  "data.table","vegan","purrr","stringr",
+                  "Biostrings","glue","ggrain","SpiecEasi",
+                  "ggpubr","flextable","qiime2R","biomformat",
+                  "Biostrings","sf","ggspatial","osmdata",
+                  "ggnewscale","ggforce","ggrepel","scales",
+                  "KEGGREST", "pulsar","huge", "pathcwork",
+                  "cowplot", "colorspace")
+
+sapply(c(cran_packages),
+       function(pkg) suppressWarnings(suppressMessages(require(pkg,character.only=TRUE))))
+```
+##############################
+
+##############################
+2. Load tables, metadata and prepare data
+##############################
+```{r}
+  # zOTU tables obtained from PipeCraft
+bacteria_table = read.csv(file = "Feature_tables/16S_fixed.csv", sep = ",") |>
+  dplyr::rename("Feature.ID" = "X.OTU.ID")
+
+fungi_table = read.csv(file = "Feature_tables/ITS_fixed.csv", sep = ",") |>
+  dplyr::rename("Feature.ID" = "X.OTU.ID")
+
+metazoan_table = read.csv(file = "Feature_tables/COI_fixed.csv", sep = ",") |>
+  dplyr::rename("Feature.ID" = "X.OTU.ID")
+
+  # Taxonomy tables
+bacteria_tax = read_qza(file = "Taxonomy/16S_taxonomy.qza")
+bacteria_tax = bacteria_tax$data |>
+  as.data.frame() |>
+  separate(Taxon, into = c("Domain", "Phyla", "Class",
+                           "Order","Family", "Genus",
+                           "Species"), sep = ";") |>
+  dplyr::select(-Confidence,-Species) |>
+  filter(Domain != "d__Archaea")
+  
+
+fung_tax = read_qza(file = "Taxonomy/ITS_taxonomy.qza")
+fung_tax = fung_tax$data |>
+  as.data.frame() |>
+  separate(Taxon, into = c("Domain", "Phyla", "Class",
+                           "Order","Family", "Genus",
+                           "Species"), sep = ";") |>
+  dplyr::select(-Confidence,-Species) |>
+  dplyr::filter(str_detect(Domain, "k__Fungi"))
+
+
+metazoa_tax = read_qza(file = "Taxonomy/COI_taxonomy.qza")
+metazoa_tax = metazoa_tax$data |>
+  as.data.frame() |>
+  separate(Taxon, into = c("Domain", "Phyla", "Class",
+                           "Order","Family", "Genus",
+                           "Species"), sep = ";") |>
+  dplyr::select(-Confidence,-Species) |>
+  dplyr::filter(!Phyla %in% c("p__Ascomycota_4890",
+                              "p__Basidiomycota_5204",
+                              "p__Chordata_7711"))
+
+  # Metadata
+metadata = read.csv(file = "Metadata/metadata.csv", sep = ",") |>
+  dplyr::rename(sampleID = Sample) |>
+  dplyr::rename(Latitude = Lat) |>
+  dplyr::rename(Longitude = Long) |>
+  dplyr::rename(Soil_system = Sistema) |>
+  mutate(Soil_system = ifelse(Soil_system == "forestal",
+                            "Conservation",Soil_system))|>
+  mutate(Soil_system = ifelse(Soil_system == "agro",
+                            "Agriculture",Soil_system))
+
+  # Filter counts based on taxonomy 
+bacteria_table = bacteria_table |>
+  filter(Feature.ID %in% bacteria_tax$Feature.ID)
+
+fungi_table = fungi_table |>
+  filter(Feature.ID %in% fung_tax$Feature.ID)
+
+metazoan_table = metazoan_table |>
+  filter(Feature.ID %in% metazoa_tax$Feature.ID)
+```
+##############################
+
+##############################
+3. Perform diversity analysis for bacteria, fungi and metazoan datasets
+##############################
+
+3.1. Run rarefaction analysis
+```{r}
+  # Bacteria
+  bacteria_rarefaction_summary = make_rarefaction_summary(count_table = bacteria_table,
+                                                          feature_col = "Feature.ID",
+                                                          rare_step = 100,
+                                                          show_labels = FALSE)
+  # Fungi
+  fungi_rarefaction_summary = make_rarefaction_summary(count_table = fungi_table,
+                                                          feature_col = "Feature.ID",
+                                                          rare_step = 100,
+                                                          show_labels = FALSE)
+  # Metazoa
+  metazoa_rarefaction_summary = make_rarefaction_summary(count_table = metazoan_table,
+                                                          feature_col = "Feature.ID",
+                                                          rare_step = 100,
+                                                          show_labels = FALSE)
+```
+
+3.2 Visualization of rarefaction analysis
+```{r}
+  # Bacteria
+  bacteria_rare_curve = bacteria_rarefaction_summary$rare_curve
+  bacteria_retention_plot = bacteria_rarefaction_summary$retention_plot
+  
+  # Fungi
+  fungi_rare_curve = fungi_rarefaction_summary$rare_curve
+  fungi_retention_plot = fungi_rarefaction_summary$retention_plot
+  
+  # Metazoa
+  metazoa_rare_curve = metazoa_rarefaction_summary$rare_curve
+  metazoa_retention_plot = metazoa_rarefaction_summary$retention_plot
+```
+
+3.3 Calcualte diversity metrics
+3.3.1 Select rarefaction treshold
+```{r}
+  # Tresholds selected preserve 90% of the samples based on rarefaction summary from 3.2
+  bacteria_rare_tresh  = 10000
+  fungi_rare_tresh = 41500
+  metazoa_rare_tresh = 29000
+```
+
+3.3.2 Run rarefaction
+```{r}
+  # Bacteria
+  bacteria_rare = rarefy_table(count_table = bacteria_table,
+                                depth = bacteria_rare_tresh,
+                                feature_col = "Feature.ID")
+  # Fungi
+  fungi_rare = rarefy_table(count_table = fungi_table,
+                                depth = fungi_rare_tresh,
+                                feature_col = "Feature.ID")
+  # Metazoa
+  metazoa_rare = rarefy_table(count_table = metazoan_table,
+                                depth = metazoa_rare_tresh,
+                                feature_col = "Feature.ID")
+```
+
+3.3.3 Calculation of alpha diversity metrics
+```{r}
+  # Alpha calculation
+  bacteria_alpha = cal_alpha_div(bacteria_rare)
+  fungi_alpha = cal_alpha_div(fungi_rare)
+  metazoa_alpha = cal_alpha_div(metazoa_rare)
+  
+  # Join alpha results with metadata
+  bacteria_alpha = bacteria_alpha |>
+    left_join(metadata, by = "sampleID")
+  
+  fungi_alpha = fungi_alpha |>
+    left_join(metadata, by = "sampleID")
+  
+  metazoa_alpha = metazoa_alpha |>
+    left_join(metadata, by = "sampleID")
+```
+
+3.3.4 Calculation of beta diversity metrics
+```{r}
+  bacteria_beta = cal_beta_div(asv_table = bacteria_rare,
+                               non_numeric_cols = "Feature.ID")
+
+  fungi_beta = cal_beta_div(asv_table = fungi_rare, 
+                            non_numeric_cols = "Feature.ID")
+  
+  metazoa_beta = cal_beta_div(asv_table = metazoa_rare, 
+                              non_numeric_cols = "Feature.ID")
+```
+
+3.3.5 Statistical comparisons of alpha diversity
+```{r}
+  alpha_comp_formula = list(Shannon ~ Soil_system,
+                            Richness ~ Soil_system,
+                            BergerParker ~ Soil_system)
+  
+  bact_div_comp = compare_alpha_diversity(formulas = alpha_comp_formula, 
+                                          data = bacteria_alpha)
+  
+  fung_div_comp = compare_alpha_diversity(formulas = alpha_comp_formula, 
+                                          data = fungi_alpha)
+  
+  meta_div_comp = compare_alpha_diversity(formulas = alpha_comp_formula, 
+                                          data = metazoa_alpha)
+```
+
+3.3.6 Statistical comparisons of beta diversity (PCoA and PERMANOVA)
+```{r Beta statitistics}
+  # Perform PCoA
+  bacteria_pcoa = perform_pcoa(dist_matrix = bacteria_beta$Bray_Curtis)
+  fungi_pcoa = perform_pcoa(dist_matrix = fungi_beta$Bray_Curtis)
+  metazoa_pcoa = perform_pcoa(dist_matrix = metazoa_beta$Bray_Curtis)
+  
+  # PERMANOVA
+  beta_formula= c("Soil_system")
+  
+  bacteria_permanova = perform_permanova(matrix_list = bacteria_beta$Bray_Curtis,
+                                        metadata = bacteria_alpha,
+                                        variables = beta_formula,
+                                        permutations = 999)
+  
+  fungi_permanova = perform_permanova(matrix_list = fungi_beta$Bray_Curtis,
+                                        metadata = fungi_alpha,
+                                        variables = beta_formula,
+                                        permutations = 999)
+  
+  metazoa_permanova = perform_permanova(matrix_list = metazoa_beta$Bray_Curtis,
+                                        metadata = metazoa_alpha,
+                                        variables = beta_formula,
+                                        permutations = 999)
+```
+
+##############################
+
+##############################
+4. Visualization of diversity metrics
+##############################
+4.1 Generate alpha diversity plots
+```{r}
+  cdmx_cols = c("#D50B56","#D3DE00")
+  
+  # Bacteria
+  shan_bact = plot_alpha(data = bacteria_alpha, x_var = "Soil_system",
+                         y_var = "Shannon", colors = cdmx_cols,
+                         title = "A", guide_title = "Management type")
+  
+  rich_bact = plot_alpha(data = bacteria_alpha, x_var = "Soil_system",
+                         y_var = "Richness", colors = cdmx_cols,
+                         title = "B")
+  
+  berg_bact = plot_alpha(data = bacteria_alpha, x_var = "Soil_system",
+                         y_var = "BergerParker", colors = cdmx_cols,
+                         title = "C")
+  
+  # Fungi
+  shan_fung = plot_alpha(data = fungi_alpha, x_var = "Soil_system",
+                         y_var = "Shannon", colors = cdmx_cols,
+                         title = "D")
+  
+  rich_fung = plot_alpha(data = fungi_alpha, x_var = "Soil_system",
+                         y_var = "Richness", colors = cdmx_cols,
+                         title = "E")
+  
+  berg_fung = plot_alpha(data = fungi_alpha, x_var = "Soil_system",
+                         y_var = "BergerParker", colors = cdmx_cols,
+                         title = "F")
+  
+  # Metazoa
+  shan_meta = plot_alpha(data = metazoa_alpha, x_var = "Soil_system",
+                         y_var = "Shannon", colors = cdmx_cols,
+                         title = "G")
+  
+  rich_meta = plot_alpha(data = metazoa_alpha, x_var = "Soil_system",
+                         y_var = "Richness", colors = cdmx_cols,
+                         title = "H")
+  
+  berg_meta = plot_alpha(data = metazoa_alpha, x_var = "Soil_system",
+                         y_var = "BergerParker", colors = cdmx_cols,
+                         title = "I")
+```
+
+4.2 Generate beta diversity plots
+```{r}
+  bact_pcoa_plot = plot_pcoa(pcoa_positions = bacteria_pcoa$positions,
+                             metadata = metadata,
+                             group_var = "Soil_system",
+                             explained = bacteria_pcoa$explained,
+                             title = "A", guide_title = "Management type",
+                             colors = cdmx_cols)
+  
+  fung_pcoa_plot = plot_pcoa(pcoa_positions = fungi_pcoa$positions,
+                             metadata = metadata,
+                             group_var = "Soil_system",
+                             explained = fungi_pcoa$explained,
+                             title = "B", guide_title = "Management type",
+                             colors = cdmx_cols)
+  
+  meta_pcoa_plot = plot_pcoa(pcoa_positions = metazoa_pcoa$positions,
+                             metadata = metadata,
+                             group_var = "Soil_system",
+                             explained = metazoa_pcoa$explained,
+                             title = "C", guide_title = "Management type",
+                             colors = cdmx_cols)
+```
+##############################
+
+##############################
+5. Taxonomic profiles per microbial group
+##############################
+5.1 Clean taxonomy tables
+```{r}
+  bacteria_taxonomy_clean = clean_taxonomy_propagate(bacteria_tax)
+  fungi_taxonomy_clean = clean_taxonomy_propagate(fung_tax)
+  metazoa_taxonomy_clean = clean_taxonomy_propagate(metazoa_tax)
+  
+  metazoa_taxonomy_clean = metazoa_taxonomy_clean |>
+    mutate(across(-Feature.ID, ~ gsub("_[0-9]+$", "", .)))
+```
+
+5.2 Compute taxonomic table summaries
+```{r}
+  # Bacteria abund summary
+  bact_abund_summary = compute_tax_abundance_table(
+    bacteria_table,
+    bacteria_taxonomy_clean,
+    metadata,
+    tax_level = "Order",
+    group_vars = c("Soil_system"))
+  
+  # Fungi abund summary
+  fung_abund_summary = compute_tax_abundance_table(
+    fungi_table,
+    fungi_taxonomy_clean,
+    metadata,
+    tax_level = "Order",
+    group_vars = c("Soil_system"))
+  
+  # Metazoa abund summary
+  meta_abund_summary = compute_tax_abundance_table(
+    metazoan_table,
+    metazoa_taxonomy_clean,
+    metadata,
+    tax_level = "Order",
+    group_vars = c("Soil_system"))
+```
+
+5.3 Generate relative abundance taxonomy barplots
+```{r Taxonomy barplots}
+  # Bacteria
+  bacteria_taxa_barplot = make_rel_abundance_barplot(asv_table = bacteria_table,
+                                                     taxonomy = bacteria_taxonomy_clean,
+                                                     metadata = metadata,
+                                                     tax_level = "Order",
+                                                     group_vars = "Soil_system",
+                                                     min_tax_rank = "Class",
+                                                     low_freq_threshold = 0.02,
+                                                     custom_colors = bacteria_cols,
+                                                     blank_axis_titles = TRUE,
+                                                     plot_title = "B")
+
+
+  # Fungi
+  fungi_taxa_barplot = make_rel_abundance_barplot(asv_table = fungi_table,
+                                                       taxonomy = fungi_taxonomy_clean,
+                                                       metadata = metadata,
+                                                       tax_level = "Order",
+                                                       group_vars = "Soil_system",
+                                                       min_tax_rank = "Class",
+                                                       low_freq_threshold = 0.02,
+                                                       custom_colors = fungi_cols,
+                                                       blank_axis_titles = TRUE,
+                                                       plot_title = "C")
+  
+  # Metazoan
+  metazoan_taxa_barplot = make_rel_abundance_barplot(asv_table = metazoan_table,
+                                                       taxonomy = metazoa_taxonomy_clean,
+                                                       metadata = metadata,
+                                                       tax_level = "Order",
+                                                       group_vars = "Soil_system",
+                                                       min_tax_rank = "Class",
+                                                       low_freq_threshold = 0.02,
+                                                       custom_colors = metazoa_cols,
+                                                       blank_axis_titles = TRUE,
+                                                       plot_title = "D")
+```
+##############################
+
+##############################
+6. Create a map showing conservation soil and sampling locations (Figure1)
+##############################
+6.1 Map creation (shape files were downloaded from INEGI portal and are provided as shp files on the github repository
+```{r}
+  # Load data
+  cons_soil_shp = st_read("Map_info/Conservation_soil/suelo-de-conservacion.shp")
+  mexico_map = st_read("Map_info/Mexico_map/dest_2010cw.shp")
+  human_sets = st_read("Map_info/Mexico_human_set/09_ciudaddemexico/conjunto_de_datos/09as.shp")
+
+  # Get data for mexico city
+  cdmx_map = mexico_map |>
+    filter(ENTIDAD == "DISTRITO FEDERAL") 
+  
+  # Transform shp files to the same coordinate measure
+  cdmx_map = st_transform(cdmx_map, crs = 4326)
+  cons_soil_shp = st_transform(cons_soil_shp, crs = 4326)
+
+  # Convert conservation poligons 
+  cons_union = cons_soil_shp |> 
+    st_union()
+
+  # Set no conservation area
+  non_cons = st_difference(cdmx_map, cons_union)
+  
+  # Get data about human settlings 
+  human_sets = human_sets |> 
+    mutate(tipo = "Human setting") |>
+    dplyr::rename(Soil_type = tipo)
+
+  # Data points
+  points_sf = metadata |>
+    dplyr::select(sampleID, Latitude, Longitude, Soil_system) |>
+    st_as_sf(coords = c("Latitude", "Longitude"), crs = 4326)
+    
+  points_sf = st_transform(points_sf, st_crs(cdmx_map))
+
+  # Plot the map 
+  samp_map = ggplot() +
+  geom_sf(data = cdmx_map, fill = NA, color = "black", size = 0.5) +
+  geom_sf(data = non_cons, fill = "#6E6E6E", color = NA, alpha = 0.3) +
+  geom_sf(data = cons_union, aes(fill = "Conservation soil"),
+          color = NA, alpha = 0.7) +
+  geom_sf(data = human_sets, aes(fill = "Urban soil"),
+          color = NA, alpha = 0.3) +
+  scale_fill_manual(name   = "Land use",
+    values = c("Conservation soil" = "#4C624E","Urban soil" = "#6E6E6E"),
+    guide = guide_legend(ncol = 1, override.aes = list(shape = 22, size = 3, 
+                                             color  = NA, stroke = 0))) +
+  new_scale_fill() +
+  geom_sf(data = points_sf, aes(fill = Soil_system), shape = 21,
+          color = "#2D3740FF", size = 3, stroke = 0.6) +
+  scale_fill_manual(name   = "Soil management",values = c("#D50B56", "#D3DE00"),
+                    guide  = guide_legend(ncol = 1, 
+                                          override.aes = list(shape = 21, size = 3))) +
+    labs(title = "A") +
+    theme_minimal()+
+    theme(plot.title.position = "right",
+          plot.title = element_text(face = "bold", size = 18))
+ 
+```
+##############################
+
+##############################
+7. Prepare data for network analysis
+##############################
+7.1 Collapse count tables at genus level
+```{r}
+  # Bacteria 
+  bacteria_table_genus = collapse_by_taxa(asv_table =  bacteria_table,
+                                          taxonomy_table = bacteria_taxonomy_clean,
+                                          level = "Genus")
+  # Fungi
+  fungi_table_genus = collapse_by_taxa(asv_table =  fungi_table,
+                                       taxonomy_table = fungi_taxonomy_clean,
+                                       level = "Genus") 
+  # Metazoa
+  metazoa_table_genus = collapse_by_taxa(asv_table =  metazoan_table,
+                                         taxonomy_table = metazoa_taxonomy_clean,
+                                         level = "Genus")
+```
+
+7.2 Split count tables by soil management type and filtering low abundant and prevalent genus
+```{r}
+  # Bacteria
+  bacteria_network_matrices = split_management(counts_df = bacteria_table_genus,
+                                               metadata = metadata,
+                                               min_total = 100,
+                                               min_prev = 0.1)
+  # Fungi
+  fungi_network_matrices = split_management(counts_df = fungi_table_genus,
+                                            metadata = metadata,
+                                            min_total = 100,
+                                            min_prev = 0.1)
+  # Metazoa
+  metazoa_network_matrices = split_management(counts_df = metazoa_table_genus,
+                                              metadata = metadata,
+                                              min_total = 100,
+                                              min_prev = 0.1)
+```
+
+7.3 Generate a combined dataset for multi-kingdom analysis
+```{r}
+ # Create a multikingdom dataset 
+  bacteria_conservation = bacteria_network_matrices$Conservation
+  fungi_conservation = fungi_network_matrices$Conservation
+
+  bacteria_agriculture = bacteria_network_matrices$Agriculture
+  fungi_agriculture = fungi_network_matrices$Agriculture
+
+    # Verify row order before cbind
+   identical(rownames(bacteria_conservation), rownames(fungi_conservation)) &&
+     identical(rownames(bacteria_conservation), rownames(metazoa_conservation))
+   
+   identical(rownames(bacteria_agriculture), rownames(fungi_agriculture)) &&
+     identical(rownames(bacteria_agriculture), rownames(metazoa_agriculture))
+   
+    # Obtain merged matrices
+    multi_kingdom_conservation = cbind(bacteria_conservation,
+                                       fungi_conservation)
+    
+    multi_kingdom_agriculture = cbind(bacteria_agriculture,
+                                      fungi_agriculture)
+```
+##############################
+
+##############################
+8. Inferring Microbial co-occurrence networks using spiec-easi
+##############################
+8.1 Infer networks
+```{r}
+  # Bacteria netwokrs
+  bact_cons_net = infer_network(bacteria_network_matrices$Conservation,
+                                nlambda = 60,
+                                lambda.min.ratio = 1e-3,
+                                pulsar.n = 400,
+                                pulsar.subsample.ratio = 0.8,
+                                pulsar.thresh = 0.1,
+                                seed = 1502)
+  
+  bact_agri_net = infer_network(bacteria_network_matrices$Agriculture,
+                                nlambda = 60,
+                                lambda.min.ratio = 1e-3,
+                                pulsar.n = 400,
+                                pulsar.subsample.ratio = 0.8,
+                                pulsar.thresh = 0.1,
+                                seed = 1502)
+
+  # Fungi netwokrs
+  fung_cons_net = infer_network(fungi_network_matrices$Conservation,
+                                nlambda = 60,
+                                lambda.min.ratio = 1e-3,
+                                pulsar.n = 400,
+                                pulsar.subsample.ratio = 0.8,
+                                pulsar.thresh = 0.1,
+                                seed = 1502)
+  
+  fung_agri_net = infer_network(fungi_network_matrices$Agriculture,
+                                nlambda = 60,
+                                lambda.min.ratio = 1e-3,
+                                pulsar.n = 400,
+                                pulsar.subsample.ratio = 0.8,
+                                pulsar.thresh = 0.1,
+                                seed = 1502)
+
+  # Metazoo netwokrs
+  meta_cons_net = infer_network(metazoa_network_matrices$Conservation,
+                                nlambda = 60,
+                                lambda.min.ratio = 1e-3,
+                                pulsar.n = 400,
+                                pulsar.subsample.ratio = 0.8,
+                                pulsar.thresh = 0.1,
+                                seed = 1502)
+  
+  meta_agri_net = infer_network(metazoa_network_matrices$Agriculture,
+                                nlambda = 60,
+                                lambda.min.ratio = 1e-3,
+                                pulsar.n = 400,
+                                pulsar.subsample.ratio = 0.8,
+                                pulsar.thresh = 0.1,
+                                seed = 1502)
+
+ 
+  # Multi-kingdom networks
+  multiK_cons_net = infer_network(multi_kingdom_conservation,
+                                  nlambda = 80,
+                                  lambda.min.ratio = 1e-4,
+                                  pulsar.n = 400,
+                                  pulsar.subsample.ratio = 0.9,
+                                  pulsar.thresh = 0.1,
+                                  seed = 1502)
+  
+  multikK_agri_net = infer_network(multi_kingdom_agriculture,
+                                   nlambda = 80,
+                                   lambda.min.ratio = 1e-4,
+                                   pulsar.n = 400,
+                                   pulsar.subsample.ratio = 0.9,
+                                   pulsar.thresh = 0.1,
+                                   seed = 1502)
+```
+
+8.2 Detecting modules
+```{r}
+  # Bacteria
+  bact_cons_modules = detect_modules(bact_cons_net,comm_method = "louvain")
+  bact_agri_modules = detect_modules(bact_agri_net,comm_method = "louvain")
+  
+  # Fungi
+  fung_cons_modules = detect_modules(fung_cons_net,comm_method = "louvain")
+  fung_agri_modules = detect_modules(fung_agri_net,comm_method = "louvain")
+  
+  # Metazoa
+  meta_cons_modules = detect_modules(meta_cons_net,comm_method = "louvain")
+  meta_agri_modules = detect_modules(meta_agri_net,comm_method = "louvain")
+  
+  # Multi-kingdom
+  multiK_cons_modules = detect_modules(multiK_cons_net,comm_method = "louvain")
+  multiK_agri_modules = detect_modules(multikK_agri_net,comm_method = "louvain")
+```
+
+8.3 Compute network metrics
+```{r}
+  # Bacteria metrics
+  bact_cons_metrics = compute_metrics(bact_cons_net, 
+                                      bact_cons_modules$comm,
+                                      bact_cons_modules$membership,
+                                      group_label = "Bacteria_Cons")
+  
+  bact_agri_metrics = compute_metrics(bact_agri_net, 
+                                      bact_agri_modules$comm,
+                                      bact_agri_modules$membership,
+                                      group_label = "Bacteria_Agri")
+  # Fungi metrics
+  fung_cons_metrics = compute_metrics(fung_cons_net, 
+                                      fung_cons_modules$comm,
+                                      fung_cons_modules$membership,
+                                      group_label = "Fungi_Cons")
+  
+  fung_agri_metrics = compute_metrics(fung_agri_net, 
+                                      fung_agri_modules$comm,
+                                      fung_agri_modules$membership,
+                                      group_label = "Fungi_Agri")
+
+  # Metazoo metrics
+  meta_cons_metrics = compute_metrics(meta_cons_net, 
+                                      meta_cons_modules$comm,
+                                      meta_cons_modules$membership,
+                                      group_label = "Metazoa_Cons")
+  
+  meta_agri_metrics = compute_metrics(meta_agri_net, 
+                                      meta_agri_modules$comm,
+                                      meta_agri_modules$membership,
+                                      group_label = "Metazoa_Agri")
+
+  # Multi-kingdom
+  multik_cons_metrics = compute_metrics(multiK_cons_net, 
+                                         multiK_cons_modules$comm,
+                                         multiK_cons_modules$membership,
+                                         group_label = "MicrEuk_Cons")
+  
+  multik_agri_metrics = compute_metrics(multikK_agri_net, 
+                                         multiK_agri_modules$comm,
+                                         multiK_agri_modules$membership,
+                                         group_label = "MicrEuk_Agri")
+```
+
+8.4 Select trheshold to plot node degree based on the 3rd quantile distrib
+```{r Select degree treshold 3rd quantile}
+  # Bacteria
+  quantile(igraph::degree(bact_cons_net))
+  quantile(igraph::degree(bact_agri_net))
+  
+  # Fungi
+  quantile(igraph::degree(fung_cons_net))
+  quantile(igraph::degree(fung_agri_net))
+  
+  # Metazoa
+  quantile(igraph::degree(meta_cons_net))
+  quantile(igraph::degree(meta_agri_net))
+
+  # MultiK
+  quantile(igraph::degree(multiK_cons_net))
+  quantile(igraph::degree(multikK_agri_net))
+```
+
+8.5 Draw per group/managment network plots
+```{r}
+  # Bacteria
+  bact_agri_plot = plot_network_comparison(
+    graph = bact_agri_net,
+    membership = bact_agri_modules$membership,
+    taxonomy = bacteria_taxonomy_clean,
+    highlight_degree = 27,
+    tax_rank = "Phyla",
+    color_by_tax = TRUE,
+    layout_algo = "graphopt", 
+    fixed_node_size = 3,
+    show_labels = FALSE,
+    node_palette = bacteria_palette,        
+    p3_node_color = "#B0BEC5",
+    seed = 1502,
+    min_abs_weight = 0.200,
+    p1_name = "A",
+    p2_name = "A",
+    p3_name = "A"
+  )
+
+  bact_cons_plot = plot_network_comparison(
+    graph = bact_cons_net,
+    membership = bact_cons_modules$membership,
+    taxonomy = bacteria_taxonomy_clean,
+    highlight_degree = 28,
+    tax_rank = "Phyla",
+    color_by_tax = TRUE,
+    layout_algo = "graphopt",  
+    fixed_node_size = 3,
+    show_labels = FALSE,
+    node_palette = bacteria_palette,        
+    p3_node_color = "#B0BEC5",
+    seed = 1502,
+    min_abs_weight = 0.224,
+    p1_name = "B",
+    p2_name = "B",
+    p3_name = "B"
+  )
+  
+  # Fungi
+  fung_agri_plot = plot_network_comparison(
+    graph = fung_agri_net,
+    membership = fung_agri_modules$membership,
+    taxonomy = fungi_taxonomy_clean,
+    highlight_degree = 31,
+    tax_rank = "Phyla",
+    color_by_tax = TRUE,
+    layout_algo = "graphopt", 
+    fixed_node_size = 3,
+    show_labels = FALSE,
+    node_palette = fungi_palette,        
+    p3_node_color = "#B0BEC5",
+    seed = 1502,
+    min_abs_weight = 0.211,
+    p1_name = "C",
+    p2_name = "C",
+    p3_name = "C"
+  )
+  
+  fung_cons_plot = plot_network_comparison(
+    graph = fung_cons_net,
+    membership = fung_cons_modules$membership,
+    taxonomy = fungi_taxonomy_clean,
+    highlight_degree = 33,
+    tax_rank = "Phyla",
+    color_by_tax = TRUE,
+    layout_algo = "graphopt",  
+    fixed_node_size = 3,
+    show_labels = FALSE,
+    node_palette = fungi_palette,        
+    p3_node_color = "#B0BEC5",
+    seed = 1502,
+    min_abs_weight = 0.213,
+    p1_name = "D",
+    p2_name = "D",
+    p3_name = "D"
+  )
+```
+##############################
+
+##############################
+9. Classify node topological propierties using the Zi-Pi framework 
+##############################
+9.1 Calculate Zi-Pi roles
+```{r}
+  # Bacteria  Zi-Pi 
+  bact_cons_zipi = compute_zipi_roles(bact_cons_net, 
+                                      bact_cons_modules$membership)
+  bact_agri_zipi = compute_zipi_roles(bact_agri_net, 
+                                      bact_agri_modules$membership)
+  
+  # Fungi  Zi-Pi 
+  fung_cons_zipi = compute_zipi_roles(fung_cons_net,
+                                      fung_cons_modules$membership)
+  fung_agri_zipi = compute_zipi_roles(fung_agri_net, 
+                                      fung_agri_modules$membership)
+  
+  # Metazoa  Zi-Pi 
+  meta_cons_zipi = compute_zipi_roles(meta_cons_net,
+                                      meta_cons_modules$membership)
+  meta_agri_zipi = compute_zipi_roles(meta_agri_net,
+                                      meta_agri_modules$membership)
+
+  # Multi-K  Zi-Pi 
+  multiK_cons_zipi = compute_zipi_roles(multiK_cons_net,
+                                        multiK_cons_modules$membership)
+  multiK_agri_zipi = compute_zipi_roles(multikK_agri_net,
+                                        multiK_agri_modules$membership)
+```
+
+9.2 Plot Zi-Pi results
+```{r}
+  # Bacteria
+  bact_cons_zipi_plot = plot_zipi(bact_cons_zipi, label_nodes = TRUE,
+                                  plot_title = "B")
+  bact_agri_zipi_plot = plot_zipi(bact_agri_zipi, label_nodes = TRUE,
+                                  plot_title = "A")
+  
+  # Fungi
+  fung_cons_zipi_plot = plot_zipi(fung_cons_zipi, label_nodes = TRUE, 
+                                  plot_title = "D")
+  fung_agri_zipi_plot = plot_zipi(fung_agri_zipi, label_nodes = TRUE,
+                                  plot_title = "C")
+
+ # Multi-K
+  multiK_cons_zipi_plot = plot_zipi(multiK_cons_zipi, label_nodes = TRUE,
+                                    plot_title = "B")
+  multiK_agri_zipi_plot = plot_zipi(multiK_agri_zipi, label_nodes = TRUE,
+                                    plot_title = "A")
+```
+##############################
+
+##############################
+10. Perform a descriptive analysis of the multi-kingdom networks
+##############################
+10.1 Draw multikindom plot
+```{r}
+  taxonomy_all = rbind(bacteria_taxonomy_clean,
+                       fungi_taxonomy_clean)
+
+  taxonomy_all$Domain = gsub("^d__", "", taxonomy_all$Domain)
+  taxonomy_all$Domain = gsub("^k__", "", taxonomy_all$Domain)
+
+
+  multik_cons_plot = plot_network_comparison(
+      graph = multiK_cons_net,
+      membership = multiK_cons_modules$membership,
+      taxonomy = taxonomy_all,
+      color_by_tax = TRUE,
+      tax_rank = "Phyla",
+      highlight_degree = 59,
+      layout_algo = "graphopt",  
+      fixed_node_size = 2,
+      show_labels = FALSE,
+      node_palette = multik_palette,        
+      p3_node_color = "#B0BEC5",
+      min_abs_weight = 0.223,
+      seed = 1502,
+      p1_name = "B",
+      p2_name = "B",
+      p3_name = "B"
+    )
+
+
+  multik_agri_plot = plot_network_comparison(
+      graph = multikK_agri_net,
+      membership = multiK_agri_modules$membership,
+      taxonomy = taxonomy_all,
+      color_by_tax = TRUE,
+      tax_rank = "Phyla",
+      highlight_degree = 61,
+      layout_algo = "graphopt",  
+      fixed_node_size = 2,
+      show_labels = FALSE,
+      node_palette = multik_palette,        
+      p3_node_color = "#B0BEC5",
+      min_abs_weight = 0.214,
+      seed = 1502,
+      p1_name = "A",
+      p2_name = "A",
+      p3_name = "A"
+    )
+  
+  multik_agri_plot$p3 
+  multik_cons_plot$p3
+```
+
+10.2 Identify and classify edge types from the multi-kingdom network
+```{r}
+kingdom_vec = taxonomy_all$Domain
+names(kingdom_vec) = taxonomy_all$Genus
+
+cons_edges = get_edge_kingdoms(multiK_cons_net,kingdom_vec)
+agri_edges = get_edge_kingdoms(multikK_agri_net,kingdom_vec)
+```
+
+10.3 Calculate the global proportions of edge types in the multi-kingdom networks
+```{r}
+cons_props = cons_edges |>
+  dplyr::count(edge_class) |>
+  dplyr::mutate(proportion = n/sum(n),management = "Conservation")
+
+agri_props = agri_edges |>
+  dplyr::count(edge_class) |>
+  dplyr::mutate(proportion = n/sum(n),management = "Agriculture")
+
+edge_props = rbind(cons_props, agri_props)
+```
+
+10.4 Plot global edge type composition
+```{r}
+agri_plot = plot_global_edge_composition(agri_props,"E")
+cons_plot = plot_global_edge_composition(cons_props,"F")
+```
+
+10.5 Add modlue identity information to nodes in the kingdom vec
+```{r}
+agri_modules = get_module_composition(multiK_agri_modules$membership,kingdom_vec)
+cons_modules = get_module_composition(multiK_cons_modules$membership,kingdom_vec)
+```
+
+10.6 Calculate the edge types within each module of the multi-kingdom network
+```{r}
+agri_module_edges = get_module_edge_types(multikK_agri_net,
+                                          multiK_agri_modules$membership,
+                                          kingdom_vec)
+
+cons_module_edges = get_module_edge_types(multiK_cons_net,
+                                          multiK_cons_modules$membership,
+                                          kingdom_vec)
+```
+
+10.7 Preapre the data to generate a stream plot showing prportion of edge types within each module
+```{r}
+agri_stream = agri_module_edges |>
+  dplyr::group_by(module) |>
+  dplyr::mutate(prop = n / sum(n)) |>
+  dplyr::ungroup()
+
+cons_stream = cons_module_edges |>
+  dplyr::group_by(module) |>
+  dplyr::mutate(prop = n / sum(n)) |>
+  dplyr::ungroup()
+
+agri_stream = agri_stream |>
+  dplyr::mutate(edge_class = factor(edge_class, levels = c("FF","BF","BB"))) |>
+  dplyr::arrange(module, edge_class) |>
+  dplyr::group_by(module) |>
+  dplyr::mutate(ymin = cumsum(prop) - prop, ymax = cumsum(prop)) |>
+  dplyr::ungroup()
+
+cons_stream = cons_stream |>
+  dplyr::mutate(edge_class = factor(edge_class, levels = c("FF","BF","BB"))) |>
+  dplyr::arrange(module, edge_class) |>
+  dplyr::group_by(module) |>
+  dplyr::mutate(ymin = cumsum(prop) - prop, ymax = cumsum(prop)) |>
+  dplyr::ungroup()
+
+module_order = sort(unique(cons_module_edges$module))
+
+stream_ribbons_cons = cons_stream |>
+  dplyr::group_by(edge_class) |>
+  dplyr::arrange(module) |>
+  dplyr::mutate(x = seq_along(module)) |>
+  dplyr::ungroup()
+
+stream_ribbons_agri = agri_stream |>
+  dplyr::group_by(edge_class) |>
+  dplyr::arrange(module) |>
+  dplyr::mutate(x = seq_along(module)) |>
+  dplyr::ungroup()
+```
+
+10.8 Generate the stream plots
+```{r}
+agri_stream_plot = plot_module_streams(agri_stream,
+                                       module_order = sort(unique(agri_stream$module)),
+                                       plot_title = "C")
+
+cons_stream_plot = plot_module_streams(cons_stream,
+                                       module_order = sort(unique(cons_stream$module)),
+                                       plot_title = "D")
+```
+
+10.9 Generation of a summary table of the proportion and weight of edge types in the multi-kingdom networks
+```{r}
+agri_signs_tab = get_edge_signs_by_class(multikK_agri_net,kingdom_vec)
+
+cons_signs_tab = get_edge_signs_by_class(multiK_cons_net,kingdom_vec)
+```
+##############################
+
+
