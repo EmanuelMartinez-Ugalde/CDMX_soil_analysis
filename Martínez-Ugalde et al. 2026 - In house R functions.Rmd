@@ -1,0 +1,1767 @@
+---
+title: "Martínez-Ugalde et al. 2026 - In house R functions"
+description: This is an R notebook that contains all the functions needed to run the analysis on the "Martínez-Ugalde et al. 2026 - Diversity and Netowork Analysis" notebook.
+---
+Functions 1 - 9 allow alpha and beta diversity analysis from rarefaction to plotting of diversity metrics
+
+Functions 10 - 12 allow the generation of a summary table of the most abundant taxa and the creation of relative abundance bar plots 
+
+Functions 13 - 18 allow the inference, analysis and plotting of co-occurrence networks using SPIEC-EASI
+
+Functions 19 - 20 allow the calculation of Zi-Pi roles of co-occurrence networks
+
+Functions 21 - 25 allow the analysis of multi-kingdom networks
+
+1. Function to perform rarefaction and retention analysis from feature/count tables
+```{r}
+make_rarefaction_summary = function(count_table, feature_col = "Feature.ID", 
+                                    rare_step = 100, threshold = NULL,
+                                    show_labels = FALSE,
+                                    retention_levels = c(90, 80, 75, 70, 60, 50),
+                                    depth_step = 500)
+  {
+  
+  # Remove rownames
+  remove_rownames = function(df) {
+    df = as.data.frame(df)
+    rownames(df) = NULL
+    return(df)
+  }
+  
+  count_table = remove_rownames(count_table)
+  
+  # Prepare numeric matrix safely
+  if (!is.null(feature_col) && feature_col %in% colnames(count_table)) {
+    mat = count_table
+    mat[, setdiff(colnames(mat), feature_col)] = lapply(
+      mat[, setdiff(colnames(mat), feature_col)],
+      function(x) as.numeric(as.character(x))
+    )
+    mat = tibble::column_to_rownames(mat, var = feature_col)
+  } else {
+    mat = as.data.frame(lapply(count_table, function(x) as.numeric(as.character(x))))
+    }
+  mat = as.matrix(mat)
+  
+  # Remove NA from count tables
+  mat[is.na(mat)] = 0
+  
+  # Transpose samples to rows
+  mat_t = t(mat)
+  
+  # Compute read counts
+  read_counts = dplyr::tibble(
+    SampleID = rownames(mat_t),
+    TotalReads = rowSums(mat_t)
+  )
+  
+# Rarefaction analysis using vegan
+  rarecurve_list = vegan::rarecurve(mat_t, step = rare_step, label = FALSE)
+  rare_df = purrr::map_df(rarecurve_list, ~ as.data.frame(t(.x)))
+  rare_tab = cbind(SampleID = rownames(mat_t), rare_df) |>
+    tibble::as_tibble() |>
+    tidyr::pivot_longer(-SampleID, names_to = "name", values_to = "value") |>
+    dplyr::filter(!is.na(value)) |>
+    dplyr::mutate(n_seqs = as.numeric(stringr::str_remove(name, "^N"))) |>
+    dplyr::select(-name)
+  
+  # Endpoints for labels
+  endpoints = rare_tab |>
+    dplyr::group_by(SampleID) |>
+    dplyr::slice_max(n_seqs, n = 1, with_ties = FALSE) |>
+    dplyr::ungroup()
+
+  
+# Retention analysis
+
+  sample_depth = endpoints |>
+    dplyr::select(SampleID, max_depth = n_seqs)
+  depth_seq = seq(0, max(sample_depth$max_depth), by = depth_step)
+  retention_df = data.frame(depth = depth_seq,
+    samples_kept = sapply(depth_seq, function(d) sum(sample_depth$max_depth >= d)))
+  retention_df$percent_kept = 100 * retention_df$samples_kept / nrow(sample_depth)
+  
+  # Draw retention thresholds
+  threshold_lines = sapply(retention_levels, function(p) {
+    min(retention_df$depth[retention_df$percent_kept <= p], na.rm = TRUE)
+  })
+  threshold_df = data.frame(
+    percent = retention_levels,
+    depth = threshold_lines
+  )
+  
+# Plot rarefaction curves
+  p = ggplot2::ggplot(rare_tab, ggplot2::aes(x = n_seqs, y = value, group = SampleID)) +
+    ggplot2::geom_line(alpha = 0.8) +
+    ggplot2::theme_classic(base_size = 12) +
+    ggplot2::labs(x = "Sequences", y = "Observed ASVs/OTUs") +
+    ggplot2::theme(panel.grid = ggplot2::element_blank())
+  
+  # Add vertical retention lines
+  p = p +
+    ggplot2::geom_vline(
+      data = threshold_df,
+      ggplot2::aes(xintercept = depth),
+      linetype = "dashed",
+      inherit.aes = FALSE) +
+    ggplot2::geom_text(
+      data = threshold_df,
+      ggplot2::aes(x = depth, y = max(rare_tab$value), 
+               label = paste0(percent, "%")),
+      angle = 90,vjust = -0.5,size = 3,inherit.aes = FALSE)
+  
+  # Colour threshold line
+  if (!is.null(threshold)) {
+    p = p + ggplot2::geom_vline(xintercept = threshold, color = "red", linetype = "dashed")
+  }
+  
+  # Optional show labels
+  if (isTRUE(show_labels)) {
+    p = p + ggplot2::geom_label(
+      data = endpoints,
+      mapping = ggplot2::aes(x = n_seqs, y = value, label = SampleID),
+      size = 3,show.legend = FALSE,inherit.aes = FALSE)
+  }
+  
+
+# Plot retention analysis
+  retention_plot = ggplot2::ggplot(retention_df, ggplot2::aes(x = depth, y = percent_kept)) +
+    ggplot2::geom_line() +
+    ggplot2::geom_hline(yintercept = retention_levels, linetype = "dashed") +
+    ggplot2::theme_classic() +
+    ggplot2::labs(x = "Sequencing depth", y = "% Samples retained")
+  
+# Return analysis results and plots 
+  return(list(
+    read_counts = read_counts,
+    rare_tab = rare_tab,
+    endpoints = endpoints,
+    rare_curve = p,
+    retention_table = retention_df,
+    retention_thresholds = threshold_df,
+    retention_plot = retention_plot
+  ))
+}
+```
+
+2. Function to rarefy feature/count tables 
+```{r}
+rarefy_table = function(count_table,depth,
+                        feature_col = NULL,
+                        return_df = TRUE) {
+  # Load vegan
+  if (!requireNamespace("vegan", quietly = TRUE)) {
+    stop("Package 'vegan' is required for rarefaction.")
+  }
+
+  # Make sure that any feature column is present in the count matrix
+  if (!is.null(feature_col) && feature_col %in% colnames(count_table)) {
+    rownames_vec = count_table[[feature_col]]
+    mat = count_table |> dplyr::select(-dplyr::all_of(feature_col))
+  } else {
+    mat = count_table
+    rownames_vec = NULL
+  }
+
+  # Convert all columns to numeric and keep only numeric colums
+  mat = mat |> dplyr::mutate(across(everything(), ~ as.numeric(trimws(as.character(.)))))
+  
+  numeric_cols = sapply(mat, is.numeric)
+  if (!any(numeric_cols)) stop("No numeric columns found for rarefaction!")
+  mat = mat[, numeric_cols, drop = FALSE]
+
+  # Convert table to matrix
+  mat = as.matrix(mat)
+  if (!is.null(rownames_vec)) rownames(mat) = rownames_vec
+
+  # Transpose so that samples are rows
+  mat_t = t(mat)
+
+  # Filter samples bellow rarefaction treshold
+  sufficient_reads = rowSums(mat_t) >= depth
+  if (any(!sufficient_reads)) {
+    warning(sum(!sufficient_reads),
+            " sample(s) have fewer reads than depth and were removed.")
+    mat_t = mat_t[sufficient_reads, , drop = FALSE]
+  }
+  if (nrow(mat_t) == 0) stop("No samples left after filtering for sufficient reads.")
+
+  # Rarefy 
+  rarefied = vegan::rrarefy(mat_t, depth)
+
+  # Remove taxa with zero counts
+  rarefied_nozero = rarefied[, colSums(rarefied) > 0, drop = FALSE]
+
+  # Return rarefied matrix as data frame
+  if (return_df) {
+    rarefied_nozero = as.data.frame(rarefied_nozero, check.names = FALSE)
+  }
+
+  return(rarefied_nozero)
+}
+```
+
+3. Function to compute alpha diversity metrics (Richness, Shannon, Faith´s PD and Berger-Parker), Faith´s PD is optional if a phylogeny tree is provided
+```{r}
+cal_alpha_div = function(asv_table, phylo_tree = NULL) {
+  # Verify rarefied table format
+  if (!is.numeric(asv_table[1, 1])) {
+    stop("ASV table should contain numeric counts with samples as rows and ASVs as columns.")
+  }
+  
+  # Calculate Observed Richness
+  richness = rowSums(asv_table > 0)
+  
+  # Calculate Shannon Index
+    shannon = vegan::diversity(asv_table, index = "shannon")
+  
+  # Calculate Berger-Parker Index (dominance)
+  berger_parker = apply(asv_table, 1, function(x) max(x) / sum(x))
+  
+  # Calculate Faith's Phylogenetic Diversity if a phylo tree was provided
+  faith_pd = NA
+  if (!is.null(phylo_tree)) {
+    # Ensure taxa are sahred between feature/count table and phylo tree
+    shared_taxa = intersect(colnames(asv_table), phylo_tree$tip.label)
+    if (length(shared_taxa) < 2) {
+      stop("Less than two shared taxa between ASV table and phylogenetic tree.")
+    }
+    
+    # Filter both to shared taxa
+    asv_table_sub = asv_table[, shared_taxa, drop = FALSE]
+    phylo_tree_sub = ape::keep.tip(phylo_tree, shared_taxa)
+    
+    # Compute Faith’s PD
+    faith_pd_res = picante::pd(asv_table_sub,
+                               phylo_tree_sub,
+                               include.root = TRUE)
+    faith_pd = faith_pd_res$PD
+    names(faith_pd) = rownames(asv_table_sub)
+  }
+  
+  # Combine all results
+  diversity_df = data.frame(
+    sampleID = rownames(asv_table),
+    Richness = richness,
+    Shannon = shannon,
+    BergerParker = berger_parker,
+    FaithPD = faith_pd[rownames(asv_table)]
+  )
+  
+  return(diversity_df)
+}
+```
+
+4. Function to compute beta diversity metrics (Bray-Curtis, Weighted and Unweighted UniFrac),
+UniFrac distance is optional if a phylogeny tree is provided
+```{r}
+cal_beta_div = function(asv_table,
+                        phylo_tree = NULL,
+                        non_numeric_cols = NULL) {
+  # Remove non numeric colums from feature/count tables
+  if (!is.null(non_numeric_cols)) {
+    keep_cols = setdiff(names(asv_table), non_numeric_cols)
+    asv_table = asv_table[, keep_cols, drop = FALSE]
+  }
+
+  # Ensure fature/count tables are numeric
+  asv_table[] = lapply(asv_table, function(x) {
+    if (is.character(x)) as.numeric(x) else x
+  })
+  asv_table = as.matrix(asv_table)
+
+  # Detect and fix orientation as vegan ask for rows = samples | columns = features
+  if (nrow(asv_table) > ncol(asv_table)) {
+    message("Detected ASVs as rows — transposing ASV table")
+    asv_table = t(asv_table)
+  }
+
+  # Compute Bray–Curtis distance
+  message("Computing Bray–Curtis distance.....")
+  bray = vegan::vegdist(asv_table, method = "bray")
+
+  # Compute UniFrac (Optional if phylo tree was provided)
+  unweighted = weighted = NULL
+  if (!is.null(phylo_tree) && inherits(phylo_tree, "phylo")) {
+    shared_taxa = intersect(colnames(asv_table), phylo_tree$tip.label)
+    if (length(shared_taxa) >= 2) {
+      message("Computing UniFrac distances (", length(shared_taxa), " shared taxa).....")
+      asv_table_sub = asv_table[, shared_taxa, drop = FALSE]
+      phylo_tree_sub = ape::keep.tip(phylo_tree, shared_taxa)
+
+      unifracs = GUniFrac::GUniFrac(asv_table_sub, phylo_tree_sub, alpha = c(0, 1))$unifracs
+      unweighted = as.dist(unifracs[, , "d_UW"])
+      weighted   = as.dist(unifracs[, , "d_1"])
+    } else {
+      warning("Not enough shared taxa between ASV table and tree, Skipping UniFrac")
+    }
+  } else if (!is.null(phylo_tree)) {
+    warning("Invalid phylo_tree provided, Skipping UniFrac")
+  } else {
+    message("No phylogenetic tree provided — only computing Bray–Curtis")
+  }
+
+  # Return computed distance matrices
+  list(
+    Bray_Curtis = bray,
+    Unweighted_UniFrac = unweighted,
+    Weighted_UniFrac = weighted
+  )
+}
+```
+
+5. Function to compare alpha diversity metrics trough Kruskal-Wallis and Dunn test 
+```{r}
+compare_alpha_diversity = function(data, formulas) {
+  results_list = list()
+  combined_results = data.frame()
+  letters_results = data.frame()
+
+  for (formula in formulas) {
+    response_var = all.vars(formula)[1]
+    group_var = all.vars(formula)[2]
+
+    # Check if variables in formulas exists in metadata
+    if (!all(c(response_var, group_var) %in% colnames(data))) {
+      warning(paste("Skipping formula:", deparse(formula),
+                    "because one or both variables not found in data"))
+      next
+    }
+
+    # Remove missing values
+    sub_data = data[!is.na(data[[response_var]]) & !is.na(data[[group_var]]),]
+
+    # Convert variable to factors
+    if (!is.factor(sub_data[[group_var]])) {
+      sub_data[[group_var]] = factor(sub_data[[group_var]])
+    }
+
+    # Check if variables have enough valid groups to perform statistics
+    group_counts = table(sub_data[[group_var]])
+    valid_groups = names(group_counts[group_counts > 1])
+
+    if (length(valid_groups) < 2) {
+      cat("Skipping", deparse(formula), ": fewer than 2 groups with >1 sample.\n")
+      next
+    }
+    cat("\nRunning:", deparse(formula), "\n")
+
+# Apply Kruskal-Wallis test
+    kw = tryCatch(kruskal.test(formula, data = sub_data),
+                  error = function(e) {
+                    warning(paste("Kruskal-Wallis failed:",deparse(formula)))
+                    NULL
+                    })
+
+    if (is.null(kw)) next
+    kw_df = data.frame(Formula = deparse(formula),Response = response_var,
+                       Group = group_var,Test = "Kruskal-Wallis",
+                       Comparison = NA,Z = NA,P_uncorrected = NA,
+                       P_adjusted = kw$p.value,Statistic = kw$statistic,
+                       Df = kw$parameter,stringsAsFactors = FALSE)
+    # Save results
+    results_list[[deparse(formula)]] = list(Kruskal_Wallis = kw_df)
+    combined_results = rbind(combined_results, kw_df)
+
+# Apply Dunn test only for significant KW results (correction for multiple test BH)
+    if (kw$p.value < 0.05) {
+      cat("Significant (p < 0.05), running Dunn post-hoc test...\n")
+      dunn = tryCatch(
+        FSA::dunnTest(formula,data = sub_data,method = "bh"),
+        error = function(e) {cat("Dunn test failed:",e$message, "\n")
+          NULL})
+
+      if (!is.null(dunn)) {
+        tmp = dunn$res
+        dunn_df = data.frame(Formula = deparse(formula),Response = response_var,
+                             Group = group_var,Test = "Dunn post-hoc",
+                             Comparison = tmp$Comparison,Z = tmp$Z,
+                             P_uncorrected = tmp$P.unadj,P_adjusted = tmp$P.adj,
+                             Statistic = NA,Df = NA,stringsAsFactors = FALSE)
+        # Save results
+        results_list[[deparse(formula)]]$Dunn_Posthoc = dunn_df
+        combined_results = rbind(combined_results, dunn_df)
+
+
+# Create a letter display used by the plot_alpha function to show significant Dunn comparisions
+        letters = tryCatch({
+          cld = rcompanion::cldList(
+            P.adj ~ Comparison,data = tmp,
+            threshold = 0.05)
+          names(cld)[1:2] = c("Group_Level", "Letter")
+          cld$Formula = deparse(formula)
+          cld$Response = response_var
+          cld$Grouping_Variable = group_var
+          cld
+        }, error = function(e) {
+          message("Could not compute letters for ", deparse(formula))
+          NULL
+        })
+
+        if (!is.null(letters)) {
+          results_list[[deparse(formula)]]$Letters = letters
+          letters_results = rbind(letters_results,letters)
+        }
+      }
+
+    } else {
+      cat("Not significant, skipping Dunn post-hoc.\n")
+    }
+  }
+
+  combined_results = combined_results[,c("Formula","Response","Group",
+                                         "Test","Comparison","Z",
+                                         "P_uncorrected","P_adjusted",
+                                         "Statistic","Df")]
+
+  return(list(Combined_Results = combined_results,
+              Detailed_Results = results_list,
+              Compact_Letters = letters_results))
+
+}
+```
+
+6. Function to generate rain cloud plots
+```{r}
+plot_alpha = function(data, x_var, y_var,colors, title = NULL,
+                      guide_title = NULL, show_title = TRUE,
+                      show.legend = TRUE, statistics = NULL,
+                      show_stats = FALSE,letter_size = 5,
+                      letter_offset = 0.05, 
+                      letter_position = c("max", "upper_whisker", "quantile"),
+                      quantile_prob = 0.99) {
+
+  letter_position = match.arg(letter_position)
+
+# Prepare data
+  
+  if (is.numeric(data[[x_var]]) && all(data[[x_var]] %in% c(0,1))) {
+    data[[x_var]] = factor(data[[x_var]],levels = c(0,1),labels = c("0","1"))
+  } else {
+    data[[x_var]] = factor(data[[x_var]])
+  }
+
+  n_groups = nlevels(data[[x_var]])
+  colors_use = rep(colors, length.out = n_groups)
+
+# Raincloud plot
+  p = ggplot(data,aes_string(x = x_var,y = y_var)) +
+    gghalves::geom_half_violin(aes_string(fill = x_var),side = "l",
+                               adjust = 0.9,nudge = 0.1,width = 0.6,
+                               alpha = 0.6,color = NA) +
+    geom_boxplot(aes_string(fill = x_var),width = 0.15,outlier.color = NA,
+                 show.legend = FALSE) +
+    ggdist::stat_dots(aes_string(fill = x_var,color = x_var),side = "right",
+                      scale = 0.2,justification = -0.55,point_size = 0.4,
+                      point_alpha = 0.6,show.legend = show.legend) +
+    scale_fill_manual(values = colors_use) +
+    scale_color_manual(values = colors_use,name = guide_title) +
+    guides(fill = "none",
+           color = guide_legend(override.aes = list(shape = 16,size = 4,
+                                                    linetype = 0))) +
+    theme_minimal() +
+    theme(legend.position = ifelse(show.legend,"bottom","none"),
+          legend.title = element_text(face = "bold"),
+          axis.title.y = element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          plot.title = element_text(face = "bold"))
+  # Plot title
+  if (show_title && !is.null(title)) {
+    p = p + labs(title = title)
+  }
+
+# Adding letters to plots, these are inherted from the compare_alpha_diversity function
+
+  if (show_stats && !is.null(statistics) && "Compact_Letters" %in% names(statistics)) {
+    letters_df = statistics$Compact_Letters
+    letters_df = subset(letters_df,Response == y_var & Grouping_Variable == x_var)
+
+    if (nrow(letters_df) > 0) {
+      ypos = aggregate(data[[y_var]],
+                       by = list(Group_Level = data[[x_var]]),
+                       FUN = function(x){
+                         if(letter_position == "max"){
+                           max(x, na.rm = TRUE)
+                           } else if(letter_position == "upper_whisker"){
+                             boxplot.stats(x)$stats[5]
+                             } else{
+                               quantile(x, probs = quantile_prob, na.rm = TRUE)
+                               }})
+      names(ypos)[2] = "y"
+      letters_df$y = ypos$y[match( letters_df$Group_Level, ypos$Group_Level)]
+      offset = diff(range(data[[y_var]], na.rm = TRUE)) * letter_offset
+      letters_df$y = letters_df$y + offset
+      letters_df$Group_Level = factor(letters_df$Group_Level,
+                                      levels = levels(data[[x_var]]))
+      
+      p = p +
+        geom_text(data = letters_df, aes(x = Group_Level, y = y, label = Letter),
+                  inherit.aes = FALSE, fontface = "bold", size = letter_size)
+    }}
+  return(p)
+}
+```
+
+7. Function to perform PCoA from distance matrices
+```{r}
+perform_pcoa = function(dist_matrix) {
+  pcoa_result = cmdscale(dist_matrix, eig = TRUE, add = TRUE)
+  positions = as.data.frame(pcoa_result$points)
+  colnames(positions)[1:2] = c("PCoA1", "PCoA2")
+  percent_explained = round(100 * pcoa_result$eig / sum(pcoa_result$eig), 1)
+  explained = percent_explained[1:2]
+  return(list(positions = positions, explained = explained))
+}
+```
+
+8. Funtion to perform PERMANOVA from a matrix list generated from cal_beta_div function
+```{r}
+perform_permanova = function(matrix_list, metadata, variables, permutations = 999) {
+  # If user supplies a single dist object wrap it into a list
+  if (inherits(matrix_list, "dist")) {
+    matrix_list = list(single_matrix = matrix_list)
+  }
+  # If matrix_list does not contain dist objects
+  if (!is.list(matrix_list)) {
+    stop("matrix_list must be either a 'dist' object or a list of 'dist' objects")
+  }
+  
+  permanova_results = list()
+  for (mat_name in names(matrix_list)) {
+    dist_matrix = matrix_list[[mat_name]]
+    # Skip if matrix is NULL or not a 'dist' object
+    if (is.null(dist_matrix) || !inherits(dist_matrix, "dist")) {
+      warning(paste("Skipping", mat_name, "- not a valid 'dist' object"))
+      next
+      }
+    
+    for (var in variables) {
+      formula = as.formula(paste("dist_matrix ~", var))
+      result = vegan::adonis2(formula, data = metadata, permutations = permutations)
+      result_df = as.data.frame(result)
+      key = paste("PERMANOVA", mat_name, var, sep = "_")
+      permanova_results[[key]] = result_df
+    }
+  }
+  return(permanova_results)
+}
+```
+
+9. Function to plot PCoA 
+```{r}
+plot_pcoa = function(pcoa_positions, metadata, group_var,
+                     explained = c(NA, NA), p_value = NULL,
+                     colors = NULL, title = NULL, 
+                     guide_title = NULL) {
+  
+  # Merge positions with metadata
+  plot_data = pcoa_positions |>
+    tibble::rownames_to_column("sampleID")|>
+    left_join(metadata)
+  
+  # Axis labels
+  xlab = glue("PCoA 1 ({explained[1]}%)")
+  ylab = glue("PCoA 2 ({explained[2]}%)")
+  
+  # Optional title with p-value
+  if (!is.null(p_value)) {
+    title = glue("{title}\np_value = {signif(p_value, 3)}")
+  }
+  
+  # Basic plot
+  p = ggplot(plot_data, aes_string(x = "PCoA1", y = "PCoA2", color = group_var)) +
+    geom_point(size = 2.5, alpha = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dotted") +
+    geom_vline(xintercept = 0, linetype = "dotted") +
+    labs(x = xlab, y = ylab, title = title, color = group_var) +
+    theme_minimal(base_size = 14)
+  
+  # Apply color palette
+  if (!is.null(colors)) {
+    p = p + scale_color_manual(values = colors, name = "Management type") +
+    theme(legend.position = "bottom",
+          legend.direction = "horizontal",
+          legend.title = element_text(face = "bold"))
+  }
+  return(p)
+}
+```
+
+10. Function to phrase taxonomy tables and propagate higher rank taxonomic assignments
+```{r}
+clean_taxonomy_propagate = function(tax_table) {
+  tax_levels = c("Domain", "Phyla", "Class", "Order", "Family", "Genus")
+  
+  # Detect which taxanomic annotations will be replaced with wihfier rank propagation logic
+  is_bad = function(x) {
+    is.na(x) | str_detect(x, regex("Incertae_Sedis|uncultured|unclassified|unknown",
+                                   ignore_case = TRUE))
+  }
+  
+  # Create a new tax table and convert to character
+  tax_clean = tax_table
+  tax_clean[tax_levels] = lapply(tax_clean[tax_levels], as.character)
+  
+  # Apply row-wise propagation
+  tax_clean[tax_levels] = t(apply(tax_clean[tax_levels], 1, function(row) {
+    last_valid = NA
+    for (i in seq_along(row)) {
+      if (is_bad(row[i])) {
+        row[i] = last_valid
+      } else {
+        last_valid = row[i]
+      }
+    }
+    return(row)
+  }))
+  return(tax_clean)
+}
+```
+
+11. Compute a summary of the relative abundance of the most abundant taxa at a specific taxonomic rank/level and grouping taxa by a specific variable present in the metadata
+```{r}
+compute_tax_abundance_table = function(asv_table,taxonomy,metadata,
+                                       tax_level = "Order",
+                                       group_vars = c("Ecoregion", "Vegetation_cover"),
+                                       low_freq_threshold = 0.01,
+                                       min_tax_rank = "Class",
+                                       enforce_prefix_consistency = TRUE,
+                                       sort_by = "global"  # "global" or "mean_sample"
+                                       ) {
+  # Taxnomic ranks/levles in taxonomy table
+  tax_levels = c("Domain", "Phyla", "Class", "Order", "Family", "Genus")
+  
+  get_rank_index = function(rank) match(rank, tax_levels)
+  min_valid_rank_index = get_rank_index(min_tax_rank)
+  
+  # Convert feature/count table to long format
+  asv_long = asv_table |>
+    pivot_longer(cols = -Feature.ID,names_to = "sampleID",values_to = "count")
+  
+  # Merge taxonomic table and featrue/count tables
+  df = asv_long |>
+    left_join(taxonomy, by = "Feature.ID") |>
+    left_join(metadata, by = "sampleID")
+  
+  # Detect shallow taxa
+  df$too_shallow = if (enforce_prefix_consistency) {
+    sapply(df[[tax_level]], function(val) {
+      if (is.na(val)) return(TRUE)
+      prefix = stringr::str_extract(val, "^[a-z]__")
+      if (is.na(prefix)) return(TRUE)
+      prefix_rank = match(prefix, c("k__", "p__", "c__", "o__", "f__", "g__"))
+      prefix_rank < min_valid_rank_index
+    })
+  } else {
+    rep(FALSE, nrow(df))
+  }
+  
+  # Compute taxa frequencies (for filtering)
+  tax_freq = df |>
+    group_by(sampleID, .data[[tax_level]]) |>
+    summarise(count = sum(count), .groups = "drop") |>
+    group_by(sampleID) |>
+    mutate(freq = count / sum(count)) |>
+    ungroup() |>
+    group_by(.data[[tax_level]]) |>
+    summarise(mean = mean(freq), .groups = "drop")
+  
+  low_taxa = tax_freq |>
+    filter(mean < low_freq_threshold) |>
+    pull(.data[[tax_level]])
+  
+  # Collapse taxa
+  df_collapsed = df |>
+    mutate(
+      !!tax_level := dplyr::case_when(is.na(.data[[tax_level]]) ~ "Other",
+                                      .data[[tax_level]] %in% low_taxa ~ "Other",
+                                      too_shallow ~ "Other",
+                                      TRUE ~ .data[[tax_level]]))
+
+  # Counts per sample
+  df_counts = df_collapsed |>
+    group_by(sampleID, across(all_of(group_vars)), .data[[tax_level]]) |>
+    summarise(count = sum(count), .groups = "drop")
+  
+  # Total sequences
+  sample_totals = df_counts |>
+    group_by(sampleID) |>
+    summarise(total_sequences = sum(count), .groups = "drop")
+  
+  df_counts = df_counts |>
+    left_join(sample_totals, by = "sampleID") |>
+    mutate(rel_abundance_sample = count / total_sequences,
+           percent_sample = rel_abundance_sample * 100)
+  
+  # Global totals
+  global_total = sum(sample_totals$total_sequences)
+  df_counts = df_counts |>
+    mutate(rel_abundance_global = count / global_total,
+           percent_global = rel_abundance_global * 100)
+  
+  # Summary table
+  summary_table = df_counts |>
+    group_by(across(all_of(group_vars)), .data[[tax_level]]) |>
+    summarise(total_count = sum(count),
+              mean_percent_sample = mean(percent_sample),
+              total_percent_global = sum(percent_global),
+              .groups = "drop")
+
+  # Sorting
+  if (sort_by == "global") {
+    summary_table = summary_table |>
+      arrange(desc(total_percent_global))
+    
+    df_counts = df_counts |>
+      arrange(desc(percent_global))
+    
+  } else if (sort_by == "mean_sample") {
+    summary_table = summary_table |>
+      arrange(desc(mean_percent_sample))
+    
+    df_counts = df_counts |>
+      arrange(desc(percent_sample))
+  }
+  
+  return(list(
+    counts_table = df_counts,
+    summary_table = summary_table
+  ))
+}
+```
+
+12. Plotting abundance bar plots
+```{r}
+make_rel_abundance_barplot = function(asv_table,taxonomy,metadata,
+                                      tax_level = "Order",
+                                      group_vars = c("Ecoregion", "Vegetation_cover"),
+                                      low_freq_threshold = 0.01,
+                                      custom_colors,palette_style = "original",
+                                      other_color = "#8F6E7C",blank_axis_titles = FALSE,
+                                      blank_axis_text_y = FALSE,min_tax_rank = "Class",
+                                      plot_title = NULL,
+                                      enforce_prefix_consistency = TRUE)
+  {
+  tax_levels = c("Domain", "Phyla", "Class", "Order", "Family", "Genus")
+  get_rank_index = function(rank) {
+    match(rank, tax_levels)
+  }
+  
+  rank_prefix = c(Domain = "k__",Phyla = "p__",Class = "c__",
+                  Order = "o__",Family = "f__",Genus = "g__")
+  
+  is_valid_at_rank = function(value, expected_prefix) {
+    if (is.na(value)) return(FALSE)
+    str_detect(value, paste0("^", expected_prefix))
+  }
+  
+  target_rank_index = get_rank_index(tax_level)
+  min_valid_rank_index = get_rank_index(min_tax_rank)
+  
+  # Convert feature/count table to long formate
+  asv_long = asv_table |>
+    pivot_longer(cols = -Feature.ID,names_to = "sampleID",
+                 values_to = "count") |>
+    group_by(sampleID) |>
+    mutate(Relative_Abundance = count / sum(count)) |>
+    ungroup()
+  
+  # Merge taxnomy and feature/count tables
+  df = asv_long |>
+    left_join(taxonomy, by = "Feature.ID") |>
+    left_join(metadata, by = "sampleID")
+  
+  # Detect invalid/shallow taxa
+ df$too_shallow = if (enforce_prefix_consistency) {
+   sapply(df[[tax_level]], function(val) {
+     if (is.na(val)) return(TRUE)
+      prefix = stringr::str_extract(val, "^[a-z]__")
+      if (is.na(prefix)) return(TRUE)
+      prefix_rank = match(prefix, c("k__", "p__", "c__", "o__", "f__", "g__"))
+      prefix_rank < min_valid_rank_index
+    })
+    
+  } else {
+    rep(FALSE, nrow(df))
+}
+  # Compute mean frequencies
+  tax_freq = df |>
+    group_by(sampleID, .data[[tax_level]]) |>
+    summarise(count = sum(count), .groups = "drop") |>
+    group_by(sampleID) |>
+    mutate(freq = count / sum(count)) |>
+    ungroup() |>
+    group_by(.data[[tax_level]]) |>
+    summarise(mean = mean(freq), .groups = "drop") |>
+    arrange(desc(mean))
+  
+  low_taxa = tax_freq |>
+    filter(mean < low_freq_threshold) |>
+    pull(.data[[tax_level]])
+  
+  # Collapse taxa at specific taxonomic rank/level
+  df_collapsed = df |>
+  mutate(!!tax_level := dplyr::case_when(is.na(.data[[tax_level]]) ~ "Other",
+                                         .data[[tax_level]] %in% low_taxa ~ "Other",
+                                         too_shallow ~ "Other",
+                                         TRUE ~ .data[[tax_level]])) |>
+  group_by(sampleID, across(all_of(group_vars)), .data[[tax_level]]) |>
+  summarise(Relative_Abundance = sum(Relative_Abundance), .groups = "drop")
+  
+
+  # Dynamic taxon order
+  tax_order = df_collapsed |>
+    group_by(.data[[tax_level]]) |>
+    summarise(mean = mean(Relative_Abundance), .groups = "drop") |>
+    arrange(desc(mean)) |>
+    pull(.data[[tax_level]])
+  tax_order = c(setdiff(tax_order, "Other"), "Other")
+  df_collapsed[[tax_level]] = factor(df_collapsed[[tax_level]], levels = tax_order)
+  
+  # Color system if a autoamtic color palette is dessired (custom collors = NULL)
+  make_pastel = function(colors, factor = 0.9) {
+    rgb_mat = col2rgb(colors)
+    pastel = rgb_mat + (255 - rgb_mat) * factor
+    rgb(pastel[1,], pastel[2,], pastel[3,], maxColorValue = 255)
+  }
+  n_taxa = length(tax_order)
+  if (length(custom_colors) < n_taxa) {
+    stop("Not enough colors provided in custom_colors")
+  }
+  my_colors = custom_colors[1:n_taxa]
+  names(my_colors) = tax_order
+  if (palette_style == "pastel") {
+    my_colors = make_pastel(my_colors, factor = 0.9)
+    names(my_colors) = tax_order
+  }
+  if ("Other" %in% tax_order) {
+    my_colors["Other"] = other_color
+  }
+  
+  # Plot realtive abudance bar plots
+  axis_title_theme = if (blank_axis_titles) element_blank() else element_text()
+  axis_text_y_theme = if (blank_axis_text_y) element_blank() else element_text()
+  
+  if (length(group_vars) == 1) {
+    p = ggplot(df_collapsed,
+               aes(x = .data[[group_vars[1]]],
+                   y = Relative_Abundance,
+                   fill = .data[[tax_level]],
+                   color = .data[[tax_level]])) +
+      geom_bar(stat = "identity",
+               position = "fill",
+               width = 0.8,
+               linewidth = 0.15,
+               alpha = 1) + 
+      scale_fill_manual(values = my_colors) +
+      scale_color_manual(values = my_colors) +
+      scale_y_continuous(labels = scales::percent) +
+      scale_x_discrete(expand = expansion(mult = c(0, 0))) +
+      guides(fill = guide_legend(ncol = 2, override.aes = list(shape = 21, size = 3)),
+             color = "none") +
+      labs(title = plot_title) +
+      theme_minimal() +
+      theme(legend.position = "bottom",
+            axis.title.x = axis_title_theme,
+            axis.title.y = axis_title_theme,
+            axis.text.y = axis_text_y_theme,
+            plot.title.position = "right",
+            plot.title = element_text(face = "bold"),
+            panel.spacing.y = unit(0, "lines"),
+            plot.margin = margin(t = 2,r = 2,b = 2,l = 2))
+    
+  } else {
+    
+    p = ggplot(df_collapsed,
+               aes(x = .data[[group_vars[2]]],
+                   y = Relative_Abundance,
+                   fill = .data[[tax_level]],
+                   color = .data[[tax_level]])) +
+      facet_grid(.data[[group_vars[1]]] ~ ., scales = "free_y", space = "free_y") +
+      geom_bar(stat = "identity",
+               position = "fill",
+               width = 0.8,
+               linewidth = 0.15,
+               alpha = 1) + 
+      scale_fill_manual(values = my_colors) +
+      scale_color_manual(values = my_colors) +
+      scale_y_continuous(labels = scales::percent) +
+      scale_x_discrete(expand = expansion(mult = c(0, 0))) +
+      guides(fill = guide_legend(ncol = 2, override.aes = list(shape = 21, size = 3)),
+             color = "none") +
+      labs(title = plot_title) +
+      theme_minimal() +
+      theme(legend.position = "bottom",
+            axis.title.x = axis_title_theme,
+            axis.title.y = axis_title_theme,
+            axis.text.y = axis_text_y_theme,
+            plot.title.position = "plot",
+            plot.title = element_text(face = "bold"),
+            panel.spacing.y = unit(0, "lines"),
+            plot.margin = margin(t = 2,r = 2,b = 2,l = 2))
+  }
+  
+  return(list(
+    plot = p,
+    data = df_collapsed,
+    tax_order = tax_order,
+    colors = my_colors
+  ))
+}
+```
+
+13. Function to collapse feature/count tables to specific taxonomic rank/level
+```{r}
+collapse_by_taxa = function(asv_table,taxonomy_table,level = "Genus") {
+    # Check if taxonomy rank is present in taxonomy table
+    if (!level %in% colnames(taxonomy_table)) {
+      stop(paste("Taxonomic level", level, "not found in taxonomy_table"))
+    }
+    
+    # Join feature/count table with taxonomy table
+    merged = asv_table |>
+      left_join(taxonomy_table, by = "Feature.ID")
+    
+    # Collapse counts by chosen raxnk/level
+    collapsed = merged |>
+      group_by(.data[[level]]) |>
+      summarise(across(where(is.numeric), sum), .groups = "drop")
+    
+    message("Collapsed ASV table at the ", level, " level")
+    return(collapsed)
+  }
+```
+
+14. Function to perform prevalence and abundance based filtering on feature/count tables and split by soil management type
+```{r}
+split_management = function(counts_df,metadata,
+                            min_total = 10,min_prev = 0.05) {
+  
+  # Edit metadata to select only Soil_system column
+  metadata = metadata |>
+    select(sampleID, Soil_system)
+  
+  # Detect the abundance columns in feature/count table
+  abundance_cols = setdiff(names(counts_df), "Genus")
+  
+  # Recover and clean only the genus column
+  counts_df = counts_df |>
+    mutate(Genus = trimws(Genus)) |>
+    filter(!is.na(Genus), Genus != "") |>
+    distinct(Genus, .keep_all = TRUE)
+  
+  # Filter low-abundance + low-prevalence taxa
+  filtered_counts = counts_df |>
+    mutate(
+      total_abundance = rowSums(across(all_of(abundance_cols)), na.rm = TRUE),
+      prevalence = rowMeans(across(all_of(abundance_cols), ~ .x > 0), na.rm = TRUE)) |>
+    filter(total_abundance >= min_total, prevalence >= min_prev) |>
+    select(-total_abundance, -prevalence)
+  
+  # Reshape feature/cout tables and join with metadata
+  mat = filtered_counts |>
+    column_to_rownames("Genus") |>
+    t() |>
+    as.data.frame() |>
+    rownames_to_column("sampleID") |>
+    inner_join(metadata, by = "sampleID")
+  
+  # Recover only abundance columns
+  abundance_cols_mat = setdiff(names(mat), c("sampleID", "Soil_system"))
+  
+  # Convert abundance columns to numeric
+  mat = mat |>
+    mutate(across(all_of(abundance_cols_mat), as.numeric))
+  
+  # Split by Sistema and remove all zero columns
+  management_mat = mat |>
+    filter(Soil_system == "Agriculture") |>
+    select(all_of(abundance_cols_mat)) |>
+    select(where(~ sum(.x, na.rm = TRUE) > 0)) |>
+    as.matrix()
+  
+  rownames(management_mat) = mat |>
+    filter(Soil_system == "Agriculture") |> 
+    pull(sampleID)
+  
+  unmanaged_mat = mat |>
+    filter(Soil_system == "Conservation") |>
+    select(all_of(abundance_cols_mat)) |>
+    select(where(~ sum(.x, na.rm = TRUE) > 0)) |>
+    as.matrix()
+  
+  rownames(unmanaged_mat) = mat |> 
+    filter(Soil_system == "Conservation") |> 
+    pull(sampleID)
+  
+  # Return
+  list(Agriculture = management_mat,
+       Conservation = unmanaged_mat
+  )
+}
+```
+
+15. Function to infer microbial co-occurrence networks using SPIEC-EASI
+```{r}
+infer_network = function(counts_mat,method = "mb",nlambda = 60,
+                         lambda.min.ratio = 1e-2,pulsar.n = 200,
+                         pulsar.thresh = 0.9,pulsar.subsample.ratio = 0.95,
+                         seed = 1502)
+  {
+  
+  # Convert to numeric matrix
+  counts_mat = as.matrix(counts_mat)
+  storage.mode(counts_mat) = "numeric"
+  
+  # Replace missing values
+  counts_mat[is.na(counts_mat)] = 0
+  
+  # Remove empty taxa and samples
+  counts_mat = counts_mat[, colSums(counts_mat) > 0, drop = FALSE]
+  counts_mat = counts_mat[rowSums(counts_mat) > 0, , drop = FALSE]
+  
+  # Check matrix dimensions
+  if (nrow(counts_mat) < 2 || ncol(counts_mat) < 2) {
+    stop("Not enough non-zero samples or taxa to infer a network")
+  }
+  
+  # Run SPIEC-EASI
+  net = spiec.easi(counts_mat,method = method,nlambda = nlambda,
+                   lambda.min.ratio = lambda.min.ratio,
+                   pulsar.params = list(thresh = pulsar.thresh,
+                                        subsample.ratio = pulsar.subsample.ratio,
+                                        ncores = 1,seed = seed,rep.num = pulsar.n)
+                   )
+  
+  # Extract adjacency matrix and edge weights
+  adj = as.matrix(getRefit(net))
+  weights = symBeta(getOptBeta(net), mode = "maxabs")
+  weights[adj == 0] = 0
+  
+  # Build an igraph object
+  g = igraph::graph_from_adjacency_matrix(adjmatrix = weights,mode = "undirected",
+                                          weighted = TRUE,diag = FALSE)
+  
+  # Assign names to nodes
+  V(g)$name = colnames(counts_mat)
+  
+  # Save outputs into an igraph object
+  attr(g, "adjacency_matrix") = adj
+  attr(g, "weight_matrix") = weights
+  attr(g, "spiec_easi_model") = net
+  
+  return(g)
+}
+```
+
+16. Function to compute network metrics
+```{r}
+compute_metrics = function(graph,comm,membership,
+                           group_label = NA,n_rand = 100) 
+  {
+  
+  # Verify if an igrpah object is provided
+  stopifnot(inherits(graph, "igraph"))
+
+  # Load graph information 
+  g_pos = graph
+  E(g_pos)$weight = abs(E(graph)$weight)
+  edge_signs = sign(E(graph)$weight)
+  
+  node_sign_mean = sapply(V(graph), function(v){
+    inc_edges = incident(graph, v)
+    if(length(inc_edges)==0)
+      return(NA_real_)
+    mean(edge_signs[inc_edges], na.rm=TRUE)
+    })
+
+  # Calcualte node node metrics
+  node_tbl = tibble::tibble(node = V(graph)$name,
+                            community = membership,
+                            degree = degree(g_pos),
+                            strength = strength(g_pos,weights = E(g_pos)$weight),
+    betweenness = betweenness(g_pos,weights = 1/(E(g_pos)$weight + 1e-6)),
+    closeness = closeness(g_pos,weights = 1/(E(g_pos)$weight + 1e-6)),
+    mean_edge_sign = node_sign_mean,
+    group = group_label)
+
+  if(!is_connected(g_pos)){
+    comps = components(g_pos)
+    g_main = induced_subgraph(g_pos,
+                              vids = V(g_pos)[comps$membership == 
+                                                which.max(comps$csize)])
+    } else {
+    g_main = g_pos
+  }
+
+  # Calculate topological metrics
+  obs_clust = transitivity(g_pos, type = "global")
+  obs_path = mean_distance(g_pos,directed = FALSE,weights = NA)
+  rand_clust = numeric(n_rand)
+  rand_path  = numeric(n_rand)
+  
+  for(i in seq_len(n_rand)){
+      g_rand = sample_gnm(
+          vcount(g_pos),ecount(g_pos),directed = FALSE)
+      rand_clust[i] = transitivity(g_rand, "global")
+      if(is_connected(g_rand)){
+          rand_path[i] = mean_distance(g_rand,directed = FALSE,weights = NA)
+      } else{
+          comps = components(g_rand)
+          g_rand = induced_subgraph(g_rand,vids = V(g_rand)
+                                    [comps$membership ==which.max(comps$csize)])
+          rand_path[i] = mean_distance(g_rand,directed = FALSE,weights = NA)
+      }
+  }
+  
+  rand_trans = mean(rand_clust)
+  rand_path = mean(rand_path)
+  sw_ratio = (obs_clust / rand_trans) / (obs_path / rand_path)
+
+  # Calculate signed metrics
+  mean_sign_total = mean(edge_signs, na.rm=TRUE)
+  edge_nodes = ends(graph, E(graph))
+  edge_df = data.frame(from = edge_nodes[,1],to = edge_nodes[,2],
+                       sign = edge_signs,stringsAsFactors = FALSE)
+  edge_df$module_from = membership[edge_df$from]
+  edge_df$module_to = membership[edge_df$to]
+  edge_df$edge_type = ifelse(edge_df$module_from == edge_df$module_to,
+                             "intra","inter")
+  intra_edges = edge_df[edge_df$edge_type=="intra",]
+  inter_edges = edge_df[edge_df$edge_type=="inter",]
+  mean_sign_by_module = tapply(intra_edges$sign,intra_edges$module_from,
+                               mean,na.rm=TRUE)
+  mean_module_sign = mean(mean_sign_by_module,na.rm=TRUE)
+  mean_intra_sign = mean(intra_edges$sign,na.rm=TRUE)
+  mean_inter_sign = mean(inter_edges$sign,na.rm=TRUE)
+
+  # Write results in to a table 
+
+  net_tbl = tibble::tibble(group = group_label,
+                           nodes = vcount(g_pos),
+                           edges = ecount(g_pos),
+                           density = edge_density(g_pos),
+                           avg_degree = mean(degree(g_pos)),
+                           avg_strength = mean(strength(g_pos,weights = E(g_pos)$weight)),
+                           clustering = obs_clust,
+                           avg_path = obs_path,
+                           diameter = diameter(g_main,directed = FALSE,weights = NA),
+                           assortativity = assortativity_degree(g_pos),
+                           sw_ratio = sw_ratio,
+                           modularity = modularity(comm),
+                           n_modules = length(unique(membership)),
+                           module_evenness = vegan::diversity(table(membership),
+                                                              index="simpson"),
+                           mean_sign_total = mean_sign_total,
+                           mean_module_sign = mean_module_sign,
+                           mean_intra_sign = mean_intra_sign,
+                           mean_inter_sign = mean_inter_sign)
+
+  return(list(node_metrics = node_tbl,network_metrics = net_tbl)
+  )
+}
+```
+
+17. Function to perform module detection
+```{r}
+detect_modules = function(graph,comm_method = "louvain",seed = 1502) 
+  {
+  set.seed(seed)
+  g_pos = graph
+  E(g_pos)$weight = abs(E(graph)$weight)
+  
+  comm = switch(comm_method,
+                fastgreedy = cluster_fast_greedy(g_pos,
+                                                 weights = E(g_pos)$weight),
+                louvain    = cluster_louvain(g_pos,
+                                             weights = E(g_pos)$weight),
+                walktrap   = cluster_walktrap(g_pos, steps = 4,
+                                              weights = E(g_pos)$weight),
+                infomap    = cluster_infomap(g_pos,
+                                             e.weights = E(g_pos)$weight),
+                label_prop = cluster_label_prop(g_pos,
+                                                weights = E(g_pos)$weight))
+  
+  membership = membership(comm)
+  list(graph_unsigned = g_pos, comm = comm, membership = membership)
+}
+```
+
+18. Function to plot microbial association networks
+```{r }
+plot_network_comparison = function(graph,membership = NULL,taxonomy = NULL,
+                                   tax_rank = "Phyla",color_by_tax = FALSE,
+                                   color_by_kingdom = FALSE,node_palette = NULL,
+                                   kingdom_palette = c(Bacteria = "#1f77b4",
+                                                       Fungi = "#2ca02c",
+                                                       Metazoa = "#d62728",
+                                                       Archaea = "#FFBB1C"),
+                                   p3_node_color = "#B0BEC5",
+                                   layout_algo = "fr",
+                                   fixed_node_size = 2,show_labels = FALSE,
+                                   seed = 1502,
+                                   p1_name = "Basic network",
+                                   p2_name = "Modular network",
+                                   p3_name = "Aggregated module network",
+                                   show_title_p1 = TRUE,show_title_p2 = TRUE,
+                                   show_title_p3 = TRUE,min_abs_weight = NULL,
+                                   highlight_degree = 8)
+  {
+
+  # Set a seed and load igraph object
+  set.seed(seed)
+  stopifnot(inherits(graph, "igraph"))
+  graph_raw = graph
+  graph_for_vis = graph
+
+
+  # Edge filtering
+  if (!is.null(min_abs_weight) && ecount(graph_for_vis) > 0) {
+    keep = abs(E(graph_for_vis)$weight) >= min_abs_weight
+    graph_for_vis = delete_edges(graph_for_vis, E(graph_for_vis)[!keep])
+  }
+
+  E(graph_for_vis)$weight_color =
+    ifelse(E(graph_for_vis)$weight >= 0, "positive", "negative")
+
+  # Detect module membership
+  unassigned_label = "__unassigned__"
+
+  if (!is.null(membership)) {
+    membership = membership[V(graph_raw)$name]
+    membership[is.na(membership)] = unassigned_label
+    membership = as.character(membership)
+  }
+
+  # Load taxonomic informaton
+  if (!is.null(taxonomy)) {
+    match_idx = match(V(graph_for_vis)$name, taxonomy$Genus)
+    V(graph_for_vis)$tax_color = taxonomy[[tax_rank]][match_idx]
+
+    if ("Domain" %in% colnames(taxonomy)) {
+      V(graph_for_vis)$Domain = taxonomy$Domain[match_idx]
+    }
+  }
+
+  # Ceate netowrk layout
+  g_layout = graph_for_vis
+  if ("weight" %in% edge_attr_names(g_layout)) {
+    E(g_layout)$weight = abs(E(g_layout)$weight) + 1e-6
+  }
+
+  layout = ggraph::create_layout(g_layout, layout_algo)
+  layout$community = if (!is.null(membership))
+    membership[layout$name] else "1"
+  layout$tax_color =
+    V(graph_for_vis)$tax_color[match(layout$name, V(graph_for_vis)$name)]
+  layout$Domain =
+    V(graph_for_vis)$Domain[match(layout$name, V(graph_for_vis)$name)]
+  layout$degree = igraph::degree(graph_raw)[layout$name]
+  layout$highlight = layout$degree >= highlight_degree
+
+
+  # Set color variables for visualization
+  node_color_var = 
+    if (color_by_kingdom) "Domain"
+    else if (color_by_tax) "tax_color"
+    else "community"
+  
+  if (is.null(node_palette)) {
+    if (color_by_tax) {
+      taxa = unique(layout$tax_color)
+      node_palette = setNames(scales::hue_pal()(length(taxa)), taxa)
+      } else if (color_by_kingdom) {
+      node_palette = kingdom_palette
+      } else {
+      modules = unique(layout$community)
+      node_palette = setNames(scales::hue_pal()(length(modules)), modules)
+      }
+    }
+
+
+  # Generate P1 basic network
+  p1 = ggraph(layout) +
+    geom_edge_link(aes(color = weight_color)) +
+    scale_edge_color_manual(values = c(positive = "#3CB371FF",negative = "#EF4444")) +
+    geom_node_point(color = "#FFBB1C", size = fixed_node_size) +
+    theme_void() +
+    {if (show_title_p1) labs(title = p1_name)}
+
+  # Generate P2 option to color nodes by degree and visualization of edges above specific treshold
+
+  color_scale = if (color_by_kingdom)
+    scale_color_manual(values = kingdom_palette,name = "Taxonomy")
+    else
+      scale_color_manual(values = node_palette,name = "Taxonomy")
+  
+  p2 = ggraph(layout) +
+    geom_edge_link(aes(color = weight_color),
+                   alpha = 0.6,width = 0.5) +
+    scale_edge_color_manual(values = c(positive = "#3CB371FF",negative = "#EF4444"),
+                            name = "Estimated co-variation") +
+    geom_node_point(shape = 16,color = "#B0BEC5",size = fixed_node_size,alpha = 0.4) +
+    geom_node_point(data = layout[layout$highlight, ],aes(color = .data[[node_color_var]]),
+                    shape = 16,size = fixed_node_size + 0.5) +
+    color_scale +
+    guides(color = guide_legend(order = 1, ncol = 1),
+           edge_color = guide_legend(order = 2)) +
+    theme_void() +
+    theme(legend.position = "right",
+          plot.title = element_text(face = "bold"),
+          legend.title = element_text(face = "bold"),
+          legend.text = element_text(size = 8)) +
+    {if (show_title_p2) labs(title = p2_name)}
+
+  # Generate P3 module network (visualization for the multikingdom analysis)
+  p3 = NULL
+  if (!is.null(membership) &&
+      !is.null(taxonomy) &&
+      vcount(graph_raw) > 0) {
+    
+    membership_vec = membership
+    names(membership_vec) = V(graph_raw)$name
+  
+    kingdom_lookup = taxonomy$Domain
+    names(kingdom_lookup) = taxonomy$Genus
+  
+    edges_df = igraph::as_data_frame(graph_raw,what = "edges") |>
+      dplyr::mutate(from_mod = membership_vec[from],to_mod   = membership_vec[to])
+  
+   
+    # Get module-module interactions
+    module_edges = edges_df |>
+      dplyr::group_by(from_mod,to_mod) |>
+      dplyr::summarise(n_edges = dplyr::n(),weight_sum = sum(weight),
+                       mean_weight = mean(weight),.groups = "drop")
+    module_edges$edge_sign = ifelse(module_edges$weight_sum > 0,
+                                    "Positive","Negative")
+  
+    # Create module graph
+    module_graph = igraph::graph_from_data_frame(module_edges,directed = FALSE)
+
+    # Set module size based on the number of taxa from each module
+    module_sizes = data.frame(module = names(table(membership_vec)),
+                              size = as.numeric(table(membership_vec)))
+    
+    # Calcualte bacteria - fungi composition from each module
+    module_comp = data.frame(node = names(membership_vec),
+                             module = membership_vec,
+                             kingdom = kingdom_lookup[names(membership_vec)]) |>
+      dplyr::filter(kingdom %in% c("Bacteria","Fungi")) |>
+      dplyr::count(module,kingdom) |>
+      tidyr::pivot_wider(names_from = kingdom,values_from = n,values_fill = 0)
+  
+    # Reorder modules numerically fro visualization
+    module_ids = as.numeric(V(module_graph)$name)
+    module_order = order(module_ids)
+    module_graph = igraph::permute(module_graph,module_order)
+
+    # Set a circular layout
+    module_layout = ggraph::create_layout(module_graph, layout = "circle")
+    module_layout$name = as.character(module_layout$name)
+    module_comp$module = as.character(module_comp$module)
+    module_sizes$module = as.character(module_sizes$module)
+    module_layout = module_layout |>
+      dplyr::left_join(module_comp,by = c("name" = "module")) |>
+      dplyr::left_join(module_sizes,by = c("name" = "module"))
+  
+    # Handel missing values in the circular layout
+    if(!"Bacteria" %in% names(module_layout))
+      module_layout$Bacteria = 0
+  
+    if(!"Fungi" %in% names(module_layout))
+      module_layout$Fungi = 0
+  
+    module_layout$Bacteria[is.na(module_layout$Bacteria)] = 0
+  
+    module_layout$Fungi[is.na(module_layout$Fungi)] = 0
+  
+    # Set label coordinates
+    label_layout = module_layout
+    r = sqrt(label_layout$x^2 + label_layout$y^2)
+    label_layout$x_label = label_layout$x / r * 1.2
+    label_layout$y_label = label_layout$y / r * 1.2
+    label_layout$label = paste0(label_layout$name)
+        
+    # Generate P3 plot
+    p3 = ggraph(module_layout) +
+      geom_edge_arc(aes(width = n_edges, color = edge_sign),
+                    alpha = 0.4, strength = 0.5, lineend = "round") +
+      scatterpie::geom_scatterpie(data = module_layout,aes(x = x, y = y,
+                                                           r =scales::rescale(sqrt(size),
+                                                                              to = c(0.05,
+                                                                                     0.12))),
+                                  cols = c("Bacteria", "Fungi"), 
+                                  color = "white", linewidth = 0.4, alpha = 0.9) +
+      geom_segment(data = label_layout, aes(x = x, y = y, xend = x_label, yend = y_label),
+                   linewidth = 0.3, colour = "#B0BEC5") +
+      geom_text(data = label_layout, aes(x = x_label,y = y_label, label = label),
+                fontface = "bold", size = 4) +
+      scale_fill_manual(values = c(Bacteria = "#EE9A49",Fungi = "#6CA6CD"),
+                        name = "Module composition") +
+      scale_edge_color_manual(values = c(Positive = "#3CB371FF",Negative = "#EF4444"),
+                              name = "Mean interaction sign") +
+      scale_edge_width(range = c(0.5, 4), 
+                       name = "Number of\ninter-module\nassociations") +
+      theme_void() +
+      theme(legend.position = "right",
+            plot.title = element_text(face = "bold"),
+            legend.title = element_text(face = "bold")) +
+      {
+        if(show_title_p3) 
+          labs(title = p3_name)
+      }
+  }
+  return(list(p1 = p1, p2 = p2, p3 = p3))
+}
+```
+
+19. Function to compute Zi-Pi roles
+```{r}
+compute_zipi_roles = function(graph,membership,weight_attr = "weight",
+                              zi_threshold = 2.5,pi_threshold = 0.62,
+                              use_weights = TRUE,use_abs_weights = TRUE,
+                              zero_tol = 1e-10)
+  {
+  
+  # Check if an igrpah object is provided and nodes have names and memebrship
+  if (!inherits(graph, "igraph")) {
+    stop("graph must be an igraph object")
+  }
+  
+  if (is.null(V(graph)$name)) {
+    stop("Graph vertices must have names")
+  }
+  
+  if (is.null(names(membership))) {
+    stop("membership must be a named vector")
+  }
+  
+  # Align membership to graph nodes
+  membership = membership[V(graph)$name]
+  
+  if (any(is.na(membership))) {
+    stop("All nodes must have a module assignment")
+  }
+  
+  modules = unique(membership)
+  
+  # Build an adjacency matrix
+  has_weights = weight_attr %in% edge_attr_names(graph)
+  
+  # For weighted networks 
+  if (use_weights && has_weights) {
+    adj = as.matrix(as_adjacency_matrix(graph,attr = weight_attr,sparse = FALSE))
+  
+    if (use_abs_weights) {
+      adj = abs(adj)
+    }
+    
+    adj[abs(adj) < zero_tol] = 0
+  } else {
+  
+  # For unweighted networks
+    adj = as.matrix(as_adjacency_matrix(graph,sparse = FALSE))
+    adj[adj != 0] = 1
+  }
+  
+  # Verify matrix symmetry
+  adj = (adj + t(adj)) / 2
+  
+  # Calcualte total node strength / degree
+  total_strength = rowSums(adj)
+  total_strength[abs(total_strength) < zero_tol] = 0
+  
+  # Calculate within-module strength
+  within_module_strength = setNames(rep(0, nrow(adj)),rownames(adj))
+  
+  for (m in modules) {
+    nodes_m = names(membership[membership == m])
+    
+    if (length(nodes_m) == 0)
+      next
+    sub_adj = adj[nodes_m,nodes_m,drop = FALSE]
+    
+    within_module_strength[nodes_m] = rowSums(sub_adj)
+  }
+  
+  # Zi calculation
+  zi = setNames(rep(0, nrow(adj)),
+                rownames(adj))
+  
+  for (m in modules) {
+    nodes_m = names(membership[membership == m])
+    k_is = within_module_strength[nodes_m]
+    
+    if (length(nodes_m) > 1 &&
+        sd(k_is) > zero_tol) {
+      zi[nodes_m] = (k_is - mean(k_is)) / sd(k_is)
+    } else {
+      zi[nodes_m] = 0
+    }
+    }
+  
+  # Pi calculation
+  pi = setNames(rep(0, nrow(adj)),
+                rownames(adj))
+  
+  for (node in rownames(adj)) {
+    k_i = total_strength[node]
+    
+    if (k_i <= zero_tol) {
+      pi[node] = 0
+      next
+    }
+    
+    # Calcualte module contributions
+    module_contributions =
+      sapply(modules, function(m) {
+        nodes_m = names(membership[membership == m])
+        sum(adj[node,nodes_m,drop = FALSE])
+      })
+    
+    module_contributions[abs(module_contributions) < zero_tol] = 0
+    frac = module_contributions / k_i
+    frac[frac < 0] = 0
+    frac[frac > 1] = 1
+    pi_val = 1 - sum(frac^2)
+    pi_val = max(min(pi_val, 1), 0)
+    pi[node] = pi_val
+  }
+  
+  # Rules for node classification
+  roles = setNames(rep("Peripheral",nrow(adj)),rownames(adj))
+  roles[zi >= zi_threshold & pi < pi_threshold] = "Module hub"
+  roles[zi < zi_threshold & pi >= pi_threshold] = "Connector"
+  roles[zi >= zi_threshold & pi >= pi_threshold] = "Network hub"
+  
+  # Save Zi-Pi results
+
+  result =
+    data.frame(
+      node = rownames(adj),
+      module = membership,
+      total_strength = total_strength,
+      within_module_strength = within_module_strength,
+      zi = zi,
+      pi = pi,
+      role = roles,
+      stringsAsFactors = FALSE
+    )
+  
+  return(result)
+}
+```
+
+20. Function to plot Zi-Pi 
+```{r Function to plot zi-pi}
+plot_zipi = function(zipi_df,label_nodes = FALSE,
+                     label_roles = c("Module hub", "Network hub"),
+                     point_size = 1.8,alpha = 0.9,plot_title = NULL)
+  {   
+  
+  zipi_df$role = factor(zipi_df$role,levels = c("Peripheral", "Connector",
+                                                "Module hub", "Network hub"))
+
+  p = ggplot(zipi_df, aes(x = pi, y = zi, color = role)) +
+    geom_point(size = point_size, alpha = alpha) +
+    geom_vline(xintercept = 0.62, linetype = "dashed", color = "black",
+               alpha = 0.8) +
+    geom_hline(yintercept = 2.5, linetype = "dashed", color = "black",
+               alpha = 0.8) +
+    {if (label_nodes)
+      geom_text_repel(data = subset(zipi_df, role %in% label_roles),
+                      aes(label = node), size = 3, max.overlaps = 20,
+                      color = "black")} +
+    scale_color_manual(values = c("Peripheral" = "#CDCDC1","Connector" = "#79CDCD",
+                                  "Module hub" = "#FFA54F","Network hub" = "#CD5555"
+                                  )) +
+    labs(x = "Participation coefficient (Pi)", 
+         y = "Within-module degree (Zi)",
+         color = "Node role", title = plot_title) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank(),
+          legend.position = "right",
+          legend.title = element_text(face = "bold"),
+          axis.title = element_text(face = "bold"),
+          plot.title = element_text(face = "bold"))
+
+  return(p)
+}
+```
+
+21. Function to classify edges as bacteria-bacteria, bacteria-fungi, and fungi-fungi
+```{r}
+get_edge_kingdoms = function(graph,kingdom_vec)
+  {
+  edge_df = igraph::as_data_frame(graph, what = "edges")
+  edge_df$kingdom_from = kingdom_vec[edge_df$from]
+  edge_df$kingdom_to = kingdom_vec[edge_df$to]
+  edge_df$edge_class = dplyr::case_when(edge_df$kingdom_from == "Bacteria" &
+                                          edge_df$kingdom_to == "Bacteria" ~
+                                          "Bacteria-Bacteria",
+                                        edge_df$kingdom_from == "Fungi" &
+                                          edge_df$kingdom_to == "Fungi" ~
+                                          "Fungi-Fungi",
+                                        TRUE ~
+                                          "Bacteria-Fungi")
+  edge_df
+}
+```
+
+22. Function to get module identity information
+```{r}
+get_module_composition = function(membership,kingdom_vec)
+  {
+
+  module_df = data.frame(node = names(membership),
+                         module = membership,
+                         kingdom = kingdom_vec[names(membership)])
+
+  module_df |>
+    dplyr::count(module, kingdom) |>
+    dplyr::group_by(module) |>
+    dplyr::mutate(proportion = n/sum(n))
+}
+```
+
+23. Function to get edge types within modules
+```{r}
+get_module_edge_types = function(graph,membership,kingdom_vec)
+  {
+  membership_vec = membership
+  names(membership_vec) = V(graph)$name
+  edge_df = igraph::as_data_frame(graph,what = "edges")
+
+  edge_df = edge_df |>
+    dplyr::mutate(module = membership_vec[from],
+                  kingdom_from = kingdom_vec[from],
+                  kingdom_to = kingdom_vec[to]) |>
+    dplyr::filter(membership_vec[from] == membership_vec[to]) |>
+    dplyr::mutate(edge_class = dplyr::case_when(kingdom_from == "Bacteria" &
+                                                  kingdom_to == "Bacteria" ~ "BB",
+                                                kingdom_from == "Fungi" &
+                                                  kingdom_to == "Fungi" ~ "FF",
+                                                TRUE ~ "BF"))
+  edge_df |> 
+    dplyr::count(module, edge_class)
+}
+```
+
+24. Function to create stream plots
+```{r}
+plot_module_streams = function(stream_df,module_order = NULL,
+                               fill_colors = c(BB = "#EE9A49",
+                                               BF = "#CDC9C9",
+                                               FF = "#6CA6CD"),
+                               plot_title = NULL)
+  {
+
+  # Preserve module numbering
+  if(is.null(module_order)){
+    module_order = sort(unique(stream_df$module))
+  }
+  
+  stream_df$module = factor(stream_df$module,levels = module_order)
+  stream_df = stream_df |>
+    mutate(x = as.numeric(module))
+
+  # Generate a base plot
+  p = ggplot()
+  
+  # Draw ribbons and add to base plot
+  for(cl in unique(stream_df$edge_class)){
+    tmp = stream_df |>
+      filter(edge_class == cl) |>
+      arrange(x)
+    p = p +
+      geom_ribbon(data = tmp, 
+                  aes(x = x,ymin = ymin,ymax = ymax, fill = edge_class),
+                  alpha = 0.65)
+  }
+  
+  # Set module separators
+  p = p +
+    geom_vline(xintercept = seq_along(module_order),linewidth = 0.4, colour = "white")
+
+  # Draw stacked bar
+  p = p +
+    geom_rect(data = stream_df,aes(xmin = x - 0.08, xmax = x + 0.08,
+                                   ymin = ymin, ymax = ymax,
+                                   fill = edge_class),
+              colour = "white", linewidth = 0.4)
+
+
+  # Formating the final plot
+  p = p +
+    scale_fill_manual(values = fill_colors, name = "Interaction type") +
+    scale_x_continuous(breaks = seq_along(module_order),
+                       labels = module_order,
+                       expand = expansion(mult = c(0.02,0.02))) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = "Module",
+    title = plot_title) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          axis.text.x = element_text(face = "bold"),
+          axis.title = element_text(face = "bold"),
+          plot.title = element_text(face = "bold"),
+          legend.title = element_text(face = "bold"))
+
+  return(p)
+}
+```
+
+25. Function to get the proportion of positive and negative edges within each module
+```{r}
+get_module_sign_summary = function(graph,membership,kingdom_vec){
+
+  membership_vec = membership
+  names(membership_vec) = igraph::V(graph)$name
+
+  edge_df = igraph::as_data_frame(graph, what = "edges") |>
+    dplyr::mutate(module_from = membership_vec[from],
+                  module_to   = membership_vec[to]) |>
+    dplyr::filter(module_from == module_to) |>
+    dplyr::mutate(module = module_from)
+
+  edge_df |>
+    dplyr::group_by(module) |>
+    dplyr::summarise(n_edges = dplyr::n(),
+                     mean_weight = mean(weight),
+                     median_weight = median(weight),
+                     mean_abs_weight = mean(abs(weight)),
+                     positive_prop = mean(weight > 0),
+                     negative_prop = mean(weight < 0),
+                     dominant_sign = dplyr::if_else(mean(weight) > 0,"Positive",
+                                                    "Negative"),
+                     .groups = "drop")
+}
+```
+
+25. Function to get the proportion of bacteria-bacteria, bacteria-fungi, and fungi-fungi edges within each module
+```{r}
+get_edge_signs_by_class = function(graph,kingdom_vec)
+  {
+
+  edge_df =igraph::as_data_frame(graph,what = "edges")
+  edge_df$kingdom_from = kingdom_vec[edge_df$from]
+  edge_df$kingdom_to = kingdom_vec[edge_df$to]
+  edge_df$edge_class = dplyr::case_when(edge_df$kingdom_from == "Bacteria" &
+                                          edge_df$kingdom_to   == "Bacteria" ~ "BB",
+                                        edge_df$kingdom_from == "Fungi" &
+                                          edge_df$kingdom_to   == "Fungi" ~ "FF",
+                                        TRUE ~ "BF")
+
+  edge_df |>
+    dplyr::group_by(edge_class) |>
+    dplyr::summarise(n_edges = dplyr::n(),mean_weight = mean(weight),
+                     median_weight = median(weight),
+                     mean_abs_weight = mean(abs(weight)),
+                     positive_prop = mean(weight > 0),
+                     negative_prop = mean(weight < 0),
+                     .groups = "drop")
+}
+```
+
